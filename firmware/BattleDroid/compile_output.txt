@@ -1,0 +1,35 @@
+﻿arduino-cli : D:\MortonWebWorks\BattleDroidNet\firmware\BattleDroid
+\BattleDroid.ino: In function 'void setup()':
+At line:1 char:44
++ ...  $env:Path; arduino-cli compile --fqbn esp32:esp32:esp32 
+d:\MortonWeb ...
++                 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\MortonWebWor...'   
+ void setup()'::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+D:\MortonWebWorks\BattleDroidNet\firmware\BattleDroid\BattleDroid.i
+no:244:11: error: 'class Audio' has no member named 'setBufsize'
+  244 |     audio.setBufsize(32768, 0); // Force 32KB internal 
+buffer, 0 PSRAM buffer
+      |           ^~~~~~~~~~
+
+[92mUsed library[0m          [92mVersion[0m [90mPath[0m
+[93mESP32-audioI2S-master[0m 3.4.4   [90mC:\Users\sgmor\Documents\Arduino\libraries\ESP32-audioI2S-master[0m
+[93mFFat[0m                  3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\FFat[0m
+[93mFS[0m                    3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\FS[0m
+[93mNetworking[0m            3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\Network[0m
+[93mNetworkClientSecure[0m   3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\NetworkClientSecure[0m
+[93mSD[0m                    3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\SD[0m
+[93mSPI[0m                   3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\SPI[0m
+[93mSD_MMC[0m                3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\SD_MMC[0m
+[93mWiFi[0m                  3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\WiFi[0m
+[93mAdafruit GFX Library[0m  1.12.4  [90mC:\Users\sgmor\Documents\Arduino\libraries\Adafruit_GFX_Library[0m
+[93mAdafruit BusIO[0m        1.17.4  [90mC:\Users\sgmor\Documents\Arduino\libraries\Adafruit_BusIO[0m
+[93mWire[0m                  3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6\libraries\Wire[0m
+[93mAdafruit SSD1306[0m      2.5.16  [90mC:\Users\sgmor\Documents\Arduino\libraries\Adafruit_SSD1306[0m
+
+[92mUsed platform[0m [92mVersion[0m [90mPath[0m
+[93mesp32:esp32[0m   3.3.6   [90mC:\Users\sgmor\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.6[0m
+Error during build: exit status 1

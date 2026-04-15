@@ -2,6 +2,8 @@
 
 Communication and Control system for HADB BattleDroids.
 
+Check out the [Sequence Syntax Guide](SEQUENCES.md) to learn how to create timed droid performances.
+
 ## Firmware
 The firmware is located in `firmware/BattleDroid/`. It is designed for ESP32 boards and uses ESP-NOW for peer-to-peer communication.
 

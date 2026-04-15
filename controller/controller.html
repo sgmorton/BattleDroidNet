@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HADB Battledroid Control Center</title>
+    <style>
+        :root {
+            --primary: #00f2ff;
+            --secondary: #0066ff;
+            --bg: #050505;
+            --glass: rgba(255, 255, 255, 0.05);
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --text: #e0e0e0;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            background: radial-gradient(circle at center, #101a2b 0%, #050505 100%);
+        }
+
+        .container {
+            width: 90%;
+            max-width: 800px;
+            background: var(--glass);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+            animation: fadeIn 0.8s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 {
+            font-size: 2rem;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            margin-bottom: 30px;
+            text-align: center;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 900;
+        }
+
+        .status-panel {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            border: 1px solid var(--glass-border);
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            background: #ff4444;
+            border-radius: 50%;
+            box-shadow: 0 0 10px #ff4444;
+        }
+
+        .status-dot.online {
+            background: #44ff44;
+            box-shadow: 0 0 10px #44ff44;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+
+        .panel {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--glass-border);
+            border-radius: 15px;
+            padding: 20px;
+        }
+
+        h2 {
+            font-size: 1rem;
+            text-transform: uppercase;
+            margin-top: 0;
+            color: var(--primary);
+            margin-bottom: 15px;
+        }
+
+        button {
+            background: var(--glass);
+            color: var(--text);
+            border: 1px solid var(--glass-border);
+            padding: 12px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+
+        button:hover {
+            background: var(--primary);
+            color: #000;
+            box-shadow: 0 0 20px rgba(0, 242, 255, 0.4);
+        }
+
+        button.active {
+            background: var(--secondary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        input[type="text"] {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--glass-border);
+            color: var(--text);
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+        }
+
+        .log {
+            height: 100px;
+            background: rgba(0, 0, 0, 0.6);
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.8rem;
+            overflow-y: auto;
+            border: 1px solid var(--glass-border);
+        }
+
+        .log div {
+            margin-bottom: 4px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .log .sent { color: #888; }
+        .log .recv { color: var(--primary); }
+
+        .fleet-panel {
+            margin: 20px 0;
+            padding: 20px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 15px;
+            border: 1px solid var(--glass-border);
+            text-align: center;
+        }
+
+        .fleet-grid {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .droid-sq {
+            width: 40px;
+            height: 40px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--glass-border);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: bold;
+            color: #444;
+            transition: all 0.5s;
+        }
+
+        .droid-sq.online {
+            background: rgba(68, 255, 68, 0.1);
+            border-color: #44ff44;
+            color: #44ff44;
+            box-shadow: 0 0 15px rgba(68, 255, 68, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HADB Battledroid Control Center</h1>
+        
+        <div class="status-panel">
+            <div class="status-item">
+                <div id="status-dot" class="status-dot"></div>
+                <span id="status-text">DISCONNECTED</span>
+            </div>
+            <button id="connect-btn" style="width: auto; margin-bottom: 0;">Connect to Droid 1</button>
+        </div>
+
+        <div class="fleet-panel">
+            <h2>Fleet Status Overview</h2>
+            <div class="fleet-grid" id="fleet-grid">
+                <div class="droid-sq" id="dsq-1">D1</div>
+                <div class="droid-sq" id="dsq-2">D2</div>
+                <div class="droid-sq" id="dsq-3">D3</div>
+                <div class="droid-sq" id="dsq-4">D4</div>
+                <div class="droid-sq" id="dsq-5">D5</div>
+                <div class="droid-sq" id="dsq-6">D6</div>
+                <div class="droid-sq" id="dsq-7">D7</div>
+                <div class="droid-sq" id="dsq-8">D8</div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="panel">
+                <h2>Operation Mode</h2>
+                <div style="display: flex; gap: 10px;">
+                    <button id="mode-auto" onclick="send('AUTO')">Auto</button>
+                    <button id="mode-manual" onclick="send('MANUAL')">Manual</button>
+                    <button id="mode-test" onclick="send('TEST')">Test</button>
+                </div>
+                <p style="font-size: 0.7rem; color: #888;">Auto mode plays sequences randomly every 2-5 minutes.</p>
+            </div>
+
+            <div class="panel">
+                <h2>Quick Sequences</h2>
+                <button onclick="send('PLAY:seq1.txt')">Execute Seq 1</button>
+                <button onclick="send('PLAY:seq2.txt')">Execute Seq 2</button>
+            </div>
+
+            <div class="panel" style="grid-column: span 2;">
+                <h2>Direct Command Injection</h2>
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="cmd-input" placeholder="e.g. PA(*, seq1) or SM(2, headturn, 75, 750)">
+                    <button id="send-btn" style="width: 100px;">Send</button>
+                </div>
+            </div>
+        </div>
+
+        <h2 style="margin-top: 20px;">Telemetry Log</h2>
+        <div id="log" class="log">
+            <div>System initialized. Waiting for connection...</div>
+        </div>
+    </div>
+
+    <script>
+        let port;
+        let writer;
+        let reader;
+
+        const connectBtn = document.getElementById('connect-btn');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const logEl = document.getElementById('log');
+        const cmdInput = document.getElementById('cmd-input');
+        const sendBtn = document.getElementById('send-btn');
+
+        function log(msg, type = '') {
+            const div = document.createElement('div');
+            div.className = type;
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logEl.appendChild(div);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            if (port) {
+                try {
+                    if (reader) {
+                        await reader.cancel();
+                        reader = null;
+                    }
+                    if (writer) {
+                        writer.releaseLock();
+                        writer = null;
+                    }
+                    await port.close();
+                    port = null;
+                    
+                    statusDot.classList.remove('online');
+                    statusText.textContent = 'DISCONNECTED';
+                    connectBtn.textContent = 'Connect to Droid 1';
+                    log('Disconnected from serial port.');
+                } catch (err) {
+                    log('Disconnect error: ' + err.message);
+                }
+                return;
+            }
+
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                
+                statusDot.classList.add('online');
+                statusText.textContent = 'CONNECTED';
+                connectBtn.textContent = 'Disconnect';
+                log('Connected to serial port.');
+
+                writer = port.writable.getWriter();
+                readLoop();
+            } catch (err) {
+                log('Error: ' + err.message);
+            }
+        });
+
+        async function readLoop() {
+            reader = port.readable.getReader();
+            let buffer = '';
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    const text = new TextDecoder().decode(value);
+                    buffer += text;
+                    
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep partial line in buffer
+
+                    for (const line of lines) {
+                        const cleanLine = line.trim();
+                        if (cleanLine.startsWith('[[STATUS:') && cleanLine.endsWith(']]')) {
+                            const statusStr = cleanLine.substring(9, 17);
+                            updateFleetUI(statusStr);
+                        } else {
+                            log(cleanLine, 'recv');
+                        }
+                    }
+                }
+            } catch (err) {
+                log('Read error: ' + err.message);
+            } finally {
+                reader.releaseLock();
+            }
+        }
+
+        function updateFleetUI(status) {
+            for (let i = 0; i < 8; i++) {
+                const sq = document.getElementById(`dsq-${i+1}`);
+                if (status[i] === '1') {
+                    sq.classList.add('online');
+                } else {
+                    sq.classList.remove('online');
+                }
+            }
+        }
+
+        async function send(data) {
+            if (!writer) {
+                log('Not connected!', 'sent');
+                return;
+            }
+            log(data, 'sent');
+            const encoder = new TextEncoder();
+            await writer.write(encoder.encode(data + '\n'));
+        }
+
+        sendBtn.addEventListener('click', () => {
+            const val = cmdInput.value.trim();
+            if (val) {
+                send('CMD:' + val);
+                cmdInput.value = '';
+            }
+        });
+
+        cmdInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendBtn.click();
+        });
+    </script>
+</body>
+</html>
