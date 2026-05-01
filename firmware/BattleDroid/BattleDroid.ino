@@ -480,7 +480,9 @@ void updateSequencer() {
   if (now - lastStatusReport > 2000) {
     char sBuf[32]; int pos = 0; pos += snprintf(sBuf + pos, sizeof(sBuf) - pos, "[[STATUS:");
     for (int i = 1; i <= 8; i++) {
-      bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000)) || i == 1;
+      bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000));
+      // Droid 1 is implicitly online only if we are the standalone Master (not web controlled)
+      if (i == 1 && !isMasterController) isOnline = true;
       sBuf[pos++] = isOnline ? '1' : '0';
     }
     snprintf(sBuf + pos, sizeof(sBuf) - pos, "]]"); Serial.println(sBuf);
@@ -625,24 +627,35 @@ void updateSerial() {
 }
 
 void updateMasterUI() {
-  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0); display.println("HADB BattleDroid");
-  display.setCursor(0, 10); 
-  const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"}; 
-  if (isMasterController) display.printf("CTRL - %s", modeStrs[currentMode]);
-  else display.printf("D%d - %s", MY_ID, modeStrs[currentMode]);
+  display.clearDisplay();
   
-  display.setCursor(0, 20); display.println(lastCommand);
-  unsigned long now = millis(); int startX = 4; int y = 40;
+  // Header (Large)
+  display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 0);
+  if (isMasterController) display.print("CONTROLLER");
+  else display.print("MASTER");
+  
+  // Mode and Command (Normal)
+  display.setTextSize(1);
+  const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
+  display.setCursor(0, 20); display.printf("MODE: %s", modeStrs[currentMode]);
+  display.setCursor(0, 32); display.print("CMD: " + lastCommand.substring(0, 20));
+
+  // Fleet Status (Boxes at bottom)
+  unsigned long now = millis();
+  int startX = 2; int y = 50; int boxW = 12; int boxH = 12; int gap = 4;
   for (int i = 1; i <= 8; i++) {
-    int x = startX + (i - 1) * 15;
-    bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000));
-    if (isOnline) display.fillRect(x, y, 12, 12, SSD1306_WHITE);
-    else display.drawRect(x, y, 12, 12, SSD1306_WHITE);
+    int x = startX + (i - 1) * (boxW + gap);
+    bool online = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 10000));
+    if (online) {
+      display.fillRect(x, y, boxW, boxH, SSD1306_WHITE);
+    } else {
+      display.drawRect(x, y, boxW, boxH, SSD1306_WHITE);
+    }
   }
   
-  // Volume Bar (Right Side)
-  int volH = map(globalVolume, 0, 10, 0, 62);
+  // Volume Bar (Right Edge)
+  int volH = map(globalVolume, 0, 10, 0, 63);
   display.drawFastVLine(127, 63 - volH, volH, SSD1306_WHITE);
   
   display.display();
@@ -650,7 +663,7 @@ void updateMasterUI() {
 
 void updateSlaveUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0); display.println("HADB BattleDroid");
+  display.setCursor(0, 0); display.println("Joined to HADB Network");
   display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID);
   display.setCursor(0, 20); display.println(lastCommand);
   display.setCursor(0, 32); display.setTextSize(2); 
