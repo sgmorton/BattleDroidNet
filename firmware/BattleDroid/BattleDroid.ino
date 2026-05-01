@@ -27,6 +27,10 @@
 // --- SERVO DEFINITIONS ---
 #define HEAD_TURN_CHUX 0
 #define HEAD_TILT_CHUX 1
+#define TORSO_TURN_CHUX 2
+
+#define VOL_UP_PIN 39
+#define VOL_DN_PIN 36
 
 #define TARGET_ALL 0xFF
 
@@ -79,6 +83,9 @@ void updateMasterUI();
 void updateSlaveUI();
 void executeCommand(packet pkg);
 void statusDisplay(String msg, int size = 1);
+void loadSettings();
+void saveSettings();
+
 void clearSDRoot();
 void copyDirToRoot(int id);
 void playDroidAudio(int id, int times);
@@ -87,15 +94,20 @@ void playWavFile(String path);
 void updateSequencer();
 void updateSerial();
 
+
 packet outPkg, inPkg;
 uint8_t broadcastAddr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t myMac[6];
 
 // --- SYSTEM STATE ---
 bool IS_MASTER = false;
+bool isMasterController = false;
 int MY_ID = 0;
 String lastCommand = "IDLE";
 unsigned long lastMasterHeard = 0;
 unsigned long droidLastSeen[11];
+bool sdAvailable = false;
+int globalVolume = 5; // Default 1-10
 
 // --- SERVO CONFIG ---
 typedef struct {
@@ -110,9 +122,10 @@ typedef struct {
   Servo servo;
 } ServoConfig;
 
-ServoConfig servos[2] = {
-  {13, 500, 2500, 50, 50, 50, 0, 0},
-  {14, 500, 2500, 50, 50, 50, 0, 0}
+ServoConfig servos[3] = {
+  {13, 500, 2500, 50, 50, 50, 0, 0}, // Head Turn
+  {14, 500, 2500, 50, 50, 50, 0, 0}, // Head Tilt
+  {12, 500, 2500, 50, 50, 50, 0, 0}  // Torso Turn
 };
 
 bool isTalking = false;
@@ -133,7 +146,7 @@ int testServoIdx = 0;
 int testPointIdx = 0;
 unsigned long lastTestMove = 0;
 int testPoints[] = {25, 50, 75};
-const char* testServos[] = {"headturn", "headtilt"};
+const char* testServos[] = {"headturn", "headtilt", "torsoturn"};
 File audioFile;
 bool audioStreaming = false;
 uint32_t audioSampleRate = 44100;
@@ -144,8 +157,18 @@ uint8_t* psramAudioBuffer = nullptr;
 int audioBufferSize = 0;
 volatile int audioHead = 0;
 volatile int audioTail = 0;
-volatile int audioBytesInQueue = 0;
 TaskHandle_t audioTaskHandle;
+
+int getAudioBytesInQueue() {
+  int h = audioHead;
+  int t = audioTail;
+  if (h >= t) return h - t;
+  return audioBufferSize - (t - h);
+}
+
+int getAudioSpaceAvailable() {
+  return audioBufferSize - getAudioBytesInQueue() - 1;
+}
 TaskHandle_t servoTaskHandle;
 
 int lastServoWrite[2] = {-1, -1};
@@ -159,13 +182,17 @@ unsigned long parseTime(String tStr) {
 }
 
 void broadcastCommand(packet pkg) {
-  esp_now_send(broadcastAddr, (uint8_t *)&pkg, sizeof(pkg));
-  if (MY_ID > 0) executeCommand(pkg);
+  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t *)&pkg, sizeof(pkg));
+  if (result != ESP_OK) Serial.println("SEND FAIL: " + String(result));
+  else Serial.println("SENT: type=" + String(pkg.msgType) + ", target=" + String(pkg.targetDroid));
+  // Execute locally if we are a droid (ID > 0) or the promoted controller
+  if (MY_ID > 0 || isMasterController) executeCommand(pkg);
 }
 
 volatile uint32_t audioDataRemaining = 0;
 
 void playWavFile(String path) {
+  if (!sdAvailable) return;
   if (audioStreaming) { 
     audioStreaming = false; 
     vTaskDelay(50 / portTICK_PERIOD_MS); // Let audioTask pause safely
@@ -217,28 +244,50 @@ void playWavFile(String path) {
   
   audioHead = 0;
   audioTail = 0;
-  audioBytesInQueue = 0;
+
+  // --- PRE-BUFFERING ---
+  // Load initial data to prevent stuttering
+  int prebufferSize = 256 * 1024; // Increased to 256KB for extra stability
+  if (audioBufferSize < prebufferSize) prebufferSize = audioBufferSize / 2;
+
+  while (audioDataRemaining > 0 && getAudioBytesInQueue() < prebufferSize) {
+    uint8_t tempBuf[2048];
+    int toRead = min((uint32_t)sizeof(tempBuf), (uint32_t)audioDataRemaining);
+    int bytesRead = audioFile.read(tempBuf, toRead);
+    if (bytesRead <= 0) break;
+
+    audioDataRemaining -= bytesRead;
+    if (globalVolume < 10) {
+      int16_t* samples = (int16_t*)tempBuf;
+      int numSamples = bytesRead / 2;
+      for (int i = 0; i < numSamples; i++) {
+        samples[i] = (int16_t)((int32_t)samples[i] * globalVolume / 10);
+      }
+    }
+
+    if (audioChannels == 1) enqueueMonoAsStereo(tempBuf, bytesRead);
+    else enqueueAudio(tempBuf, bytesRead);
+  }
+
   audioStreaming = true;
 }
 
 void enqueueAudio(uint8_t* data, int len) {
-  if (audioBufferSize - audioBytesInQueue < len) return;
+  if (getAudioSpaceAvailable() < len) return;
   int firstChunk = min(len, audioBufferSize - audioHead);
   memcpy(psramAudioBuffer + audioHead, data, firstChunk);
   if (firstChunk < len) memcpy(psramAudioBuffer, data + firstChunk, len - firstChunk);
   audioHead = (audioHead + len) % audioBufferSize;
-  audioBytesInQueue += len;
 }
 
 void enqueueMonoAsStereo(uint8_t* monoData, int len) {
-  if (audioBufferSize - audioBytesInQueue < len * 2) return;
+  if (getAudioSpaceAvailable() < len * 2) return;
   for (int i = 0; i < len; i += 2) {
     psramAudioBuffer[audioHead] = monoData[i]; audioHead = (audioHead + 1) % audioBufferSize;
     psramAudioBuffer[audioHead] = monoData[i+1]; audioHead = (audioHead + 1) % audioBufferSize;
     psramAudioBuffer[audioHead] = monoData[i]; audioHead = (audioHead + 1) % audioBufferSize;
     psramAudioBuffer[audioHead] = monoData[i+1]; audioHead = (audioHead + 1) % audioBufferSize;
   }
-  audioBytesInQueue += len * 2;
 }
 
 void audioTask(void *parameter) {
@@ -246,28 +295,41 @@ void audioTask(void *parameter) {
     if (audioStreaming) {
       bool didWork = false;
       
-      if (audioDataRemaining > 0 && (audioBufferSize - audioBytesInQueue) >= 4096) {
-        uint8_t tempBuf[2048];
+      // Aggressive Buffer Refill
+      while (audioDataRemaining > 0 && getAudioSpaceAvailable() >= 8192) {
+        uint8_t tempBuf[4096];
         int toRead = min((uint32_t)sizeof(tempBuf), (uint32_t)audioDataRemaining);
         int bytesRead = audioFile.read(tempBuf, toRead);
         if (bytesRead > 0) {
           audioDataRemaining -= bytesRead;
+          
+          // Apply Volume Scaling
+          if (globalVolume < 10) {
+            int16_t* samples = (int16_t*)tempBuf;
+            int numSamples = bytesRead / 2;
+            for (int i = 0; i < numSamples; i++) {
+              samples[i] = (int16_t)((int32_t)samples[i] * globalVolume / 10);
+            }
+          }
           if (audioChannels == 1) enqueueMonoAsStereo(tempBuf, bytesRead);
           else enqueueAudio(tempBuf, bytesRead);
           didWork = true;
         } else {
           audioDataRemaining = 0; // Force end on read error
+          break;
         }
+        // Yield occasionally if we're doing a lot of reads
+        vTaskDelay(1 / portTICK_PERIOD_MS); 
       }
 
-      if (audioBytesInQueue > 0) {
+      int bytesInQueue = getAudioBytesInQueue();
+      if (bytesInQueue > 0) {
         size_t bytesWritten = 0;
-        int chunk = min((int)audioBytesInQueue, 4096);
+        int chunk = min(bytesInQueue, 4096);
         int contigChunk = min(chunk, audioBufferSize - audioTail);
         i2s_write(I2S_NUM_0, psramAudioBuffer + audioTail, contigChunk, &bytesWritten, 0);
         if (bytesWritten > 0) {
           audioTail = (audioTail + bytesWritten) % audioBufferSize;
-          audioBytesInQueue -= bytesWritten;
           didWork = true;
         }
       } else if (audioDataRemaining == 0) {
@@ -285,20 +347,46 @@ void audioTask(void *parameter) {
   }
 }
 
-void sequencerTask(void *parameter) {
-  while (true) {
-    unsigned long now = millis(); static unsigned long lastUpdate = 0;
-    if (now - lastUpdate > 1500) {
+void loop() {
+  static bool loopStarted = false;
+  if (!loopStarted) { Serial.println("LOOP: STARTED"); loopStarted = true; }
+  unsigned long now = millis(); static unsigned long lastUpdate = 0;
+  if (now - lastUpdate > 200) { 
+    if (isMasterController) MY_ID = 0; 
+
+    // Handle Volume Rocker
+    static int lastVolUp = HIGH, lastVolDn = HIGH;
+    int volUp = digitalRead(VOL_UP_PIN);
+    int volDn = digitalRead(VOL_DN_PIN);
+    if (volUp == LOW && lastVolUp == HIGH) {
+      if (globalVolume < 10) { globalVolume++; Serial.printf("VOL UP: %d\n", globalVolume); saveSettings(); }
+    }
+    if (volDn == LOW && lastVolDn == HIGH) {
+      if (globalVolume > 0) { globalVolume--; Serial.printf("VOL DN: %d\n", globalVolume); saveSettings(); }
+    }
+    lastVolUp = volUp; lastVolDn = volDn;
+
+    if (IS_MASTER) {
       outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
       esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
       droidLastSeen[MY_ID] = now;
-      if (IS_MASTER) updateMasterUI(); else updateSlaveUI();
-      lastUpdate = now;
+      updateMasterUI();
+    } else {
+      static unsigned long lastHb = 0;
+      if (now - lastHb > 1000) { 
+        outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
+        esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
+        Serial.println("SENT HB ME=" + String(MY_ID));
+        lastHb = now;
+      }
+      static unsigned long lastUi = 0;
+      if (now - lastUi > 500) { updateSlaveUI(); lastUi = now; }
     }
-    updateSequencer(); 
-    updateSerial();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    lastUpdate = now;
   }
+  updateSequencer(); 
+  updateSerial();
+  vTaskDelay(10 / portTICK_PERIOD_MS);
 }
 
 void servoTask(void *parameter) {
@@ -352,6 +440,7 @@ void updateSequencer() {
         int startSearch = testDroidIdx;
         for (int i = 0; i < 8; i++) {
           testDroidIdx++; if (testDroidIdx > 8) testDroidIdx = 1;
+          // Test if droid is online OR if it's Droid 1 (always test D1)
           if ((droidLastSeen[testDroidIdx] > 0 && (now - droidLastSeen[testDroidIdx] < 8000)) || testDroidIdx == 1) { foundNext = true; break; }
           if (testDroidIdx == startSearch) break;
         }
@@ -394,6 +483,11 @@ void updateSequencer() {
       sBuf[pos++] = isOnline ? '1' : '0';
     }
     snprintf(sBuf + pos, sizeof(sBuf) - pos, "]]"); Serial.println(sBuf);
+    
+    // Mode report for Web UI
+    const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
+    Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]");
+
     lastStatusReport = now;
   }
 
@@ -418,6 +512,8 @@ void updateSequencer() {
         if (pendingCommands.startsWith("PA")) {
           p.msgType = CMD_PLAY_AUDIO;
           int s = pendingCommands.indexOf('('); int c = pendingCommands.indexOf(','); int e = pendingCommands.indexOf(')');
+          String idStr = pendingCommands.substring(s + 1, c); idStr.trim();
+          if (idStr != "*") p.targetDroid = idStr.toInt();
           String cmd = pendingCommands.substring(c + 1, e); cmd.trim();
           memset(p.cmdStr, 0, 16); strncpy(p.cmdStr, cmd.c_str(), 15);
           broadcastCommand(p);
@@ -446,28 +542,90 @@ void updateSequencer() {
 }
 
 void updateSerial() {
-  if (!IS_MASTER) return;
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n'); line.trim();
+    Serial.println("RECV SERIAL: " + line);
+    if (line == "CONTROLLER") {
+      isMasterController = true;
+      IS_MASTER = true;
+      MY_ID = 0; 
+      for(int i=0; i<11; i++) droidLastSeen[i] = 0;
+      statusDisplay("CTRL MODE", 1);
+      Serial.println("PROMOTED TO D0 CONTROLLER");
+      return;
+    }
+    
+    if (!IS_MASTER) return; // Only Master (or promoted controller) handles fleet commands
+
     if (line == "AUTO") currentMode = MODE_AUTO;
     else if (line == "MANUAL") currentMode = MODE_MANUAL;
     else if (line == "TEST") currentMode = MODE_TEST;
+    else if (line.startsWith("SETID ")) {
+      MY_ID = line.substring(6).toInt();
+      saveSettings();
+      Serial.printf("ID SET TO D%d\n", MY_ID);
+    }
+    else if (line == "RESET") {
+      packet p = {}; p.msgType = CMD_RESET; p.targetDroid = TARGET_ALL;
+      broadcastCommand(p);
+      Serial.println("SENT FLEET RESET");
+    }
     else if (line.startsWith("PLAY:")) startSequence(("/" + line.substring(5)).c_str());
-    else if (line.startsWith("CMD:")) { pendingCommands = line.substring(4); nextEventTime = 0; sequenceActive = true; }
+    else if (line.startsWith("CMD:")) {
+      String cmd = line.substring(4); cmd.trim();
+      packet p = {}; p.targetDroid = TARGET_ALL;
+      
+      int openP = cmd.indexOf('('); int comma = cmd.indexOf(','); int closeP = cmd.indexOf(')');
+      if (openP != -1 && comma != -1) {
+        String targetStr = cmd.substring(openP + 1, comma); targetStr.trim();
+        if (targetStr == "*") p.targetDroid = TARGET_ALL;
+        else p.targetDroid = (uint8_t)targetStr.toInt();
+
+        String typeStr = cmd.substring(0, openP);
+        if (typeStr == "PA") {
+          p.msgType = CMD_PLAY_AUDIO;
+          String file = cmd.substring(comma + 1, closeP); file.trim();
+          memset(p.cmdStr, 0, 16); strncpy(p.cmdStr, file.c_str(), 15);
+          Serial.printf("SERIAL PA: Target=%d File=%s\n", p.targetDroid, p.cmdStr);
+          broadcastCommand(p);
+        } else if (typeStr == "SM") {
+          p.msgType = CMD_SERVO_MOVE;
+          int c2 = cmd.indexOf(',', comma + 1); int c3 = cmd.indexOf(',', c2 + 1);
+          String servo = cmd.substring(comma + 1, c2); servo.trim();
+          memset(p.cmdStr, 0, 16); strncpy(p.cmdStr, servo.c_str(), 15);
+          p.param2 = cmd.substring(c2 + 1, c3).toInt(); p.param3 = cmd.substring(c3 + 1, closeP).toInt();
+          broadcastCommand(p);
+        } else if (typeStr == "T" || typeStr == "TK") {
+          p.msgType = CMD_TALK;
+          p.param1 = cmd.substring(comma + 1, closeP).toInt();
+          broadcastCommand(p);
+        }
+      }
+    }
   }
 }
 
 void updateMasterUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0); display.println("HADB BattleDroid");
-  display.setCursor(0, 10); const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"}; display.printf("D%d - %s", MY_ID, modeStrs[currentMode]);
+  display.setCursor(0, 10); 
+  const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"}; 
+  if (isMasterController) display.printf("CTRL - %s", modeStrs[currentMode]);
+  else display.printf("D%d - %s", MY_ID, modeStrs[currentMode]);
+  
   display.setCursor(0, 20); display.println(lastCommand);
   unsigned long now = millis(); int startX = 4; int y = 40;
   for (int i = 1; i <= 8; i++) {
     int x = startX + (i - 1) * 15;
-    if ((droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000)) || i == 1) display.fillRect(x, y, 12, 12, SSD1306_WHITE);
+    bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000));
+    if (isOnline) display.fillRect(x, y, 12, 12, SSD1306_WHITE);
     else display.drawRect(x, y, 12, 12, SSD1306_WHITE);
   }
+  
+  // Volume Bar (Right Side)
+  int volH = map(globalVolume, 0, 10, 0, 62);
+  display.drawFastVLine(127, 63 - volH, volH, SSD1306_WHITE);
+  
   display.display();
 }
 
@@ -476,13 +634,38 @@ void updateSlaveUI() {
   display.setCursor(0, 0); display.println("HADB BattleDroid");
   display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID);
   display.setCursor(0, 20); display.println(lastCommand);
-  display.setCursor(0, 32); display.setTextSize(2); if (MY_ID == 0) display.println("SEARCH"); else display.printf("UNIT: D%d", MY_ID);
+  display.setCursor(0, 32); display.setTextSize(2); 
+  if (MY_ID == 0) display.println("SEARCH"); 
+  else display.printf("UNIT: D%d", MY_ID);
+
+  // Volume Bar (Right Side)
+  int volH = map(globalVolume, 0, 10, 0, 62);
+  display.drawFastVLine(127, 63 - volH, volH, SSD1306_WHITE);
+
   display.display();
 }
 
 void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  // Prevent executing our own broadcasts (loopback)
+  if (memcmp(info->src_addr, myMac, 6) == 0) return;
+
   memcpy(&inPkg, data, sizeof(inPkg));
-  if (inPkg.msgType == CMD_ID_REQUEST && IS_MASTER) {
+  if (IS_MASTER && inPkg.msgType != CMD_HEARTBEAT) Serial.println("RECV PKT: T=" + String(inPkg.targetDroid) + " ME=" + String(MY_ID) + " TYPE=" + String(inPkg.msgType));
+
+  if (inPkg.msgType == CMD_HEARTBEAT) {
+    if (inPkg.targetDroid == 0 || inPkg.targetDroid == 1) lastMasterHeard = millis();
+    if (IS_MASTER && inPkg.targetDroid > 0 && inPkg.targetDroid <= 8) {
+      if (droidLastSeen[inPkg.targetDroid] == 0) Serial.println("FLEET: D" + String(inPkg.targetDroid) + " ONLINE");
+      droidLastSeen[inPkg.targetDroid] = millis();
+    }
+  } else if (inPkg.msgType == CMD_RESET) {
+    Serial.println("FLEET RESET RECEIVED");
+    if (!isMasterController) {
+      MY_ID = 0; lastMasterHeard = 0; IS_MASTER = false; lastCommand = "RESETTING...";
+    }
+  } else if (inPkg.msgType >= CMD_SERVO_MOVE) {
+    executeCommand(inPkg);
+  } else if (inPkg.msgType == CMD_ID_REQUEST && IS_MASTER) {
     int slot = -1; unsigned long now = millis();
     for (int i = 2; i <= 8; i++) { if (droidLastSeen[i] == 0 || (now - droidLastSeen[i] > 10000)) { slot = i; break; } }
     if (slot != -1) {
@@ -490,16 +673,21 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
       if (!esp_now_is_peer_exist(info->src_addr)) esp_now_add_peer(&p);
       packet assign = {CMD_ID_ASSIGN, (uint8_t)slot}; esp_now_send(info->src_addr, (uint8_t *)&assign, sizeof(assign));
     }
+  } else if (inPkg.msgType == CMD_ID_ASSIGN && MY_ID == 0 && !isMasterController) {
+    MY_ID = inPkg.targetDroid;
   }
-  if (!IS_MASTER && inPkg.msgType == CMD_ID_ASSIGN && MY_ID == 0) { MY_ID = inPkg.targetDroid; }
-  if (inPkg.msgType == CMD_HEARTBEAT) {
-    if (inPkg.targetDroid == 1) lastMasterHeard = millis();
-    if (IS_MASTER && inPkg.targetDroid > 0 && inPkg.targetDroid <= 8) droidLastSeen[inPkg.targetDroid] = millis();
-  } else if (!IS_MASTER) executeCommand(inPkg);
 }
 
 void setup() {
-  Serial.begin(115200); delay(500);
+  Serial.begin(115200);
+  for(int i=0; i<3; i++) { 
+    Serial.println("###################################");
+    Serial.println("###   BATTLE DROID V2.1 ACTIVE  ###");
+    Serial.println("###################################");
+    delay(100); 
+  }
+  Serial.println("--- BattleDroid System Online ---");
+
   Wire.begin(OLED_SDA, OLED_SCL); Wire.setClock(400000); display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay(); display.display();
 
@@ -527,20 +715,31 @@ void setup() {
     Serial.println("Using 32KB DRAM Audio Buffer");
   }
 
-  // Isolate Audio to Core 1 (APP_CPU), highest priority to prevent I2S starvation
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 1);
-  
-  // Isolate Servos and Sequencer to Core 0 (PRO_CPU), runs alongside Wi-Fi/ESP-NOW
-  xTaskCreatePinnedToCore(servoTask, "ServoTask", 4096, NULL, 1, &servoTaskHandle, 0);
-  xTaskCreatePinnedToCore(sequencerTask, "SeqTask", 8192, NULL, 1, NULL, 0);
-
   WiFi.mode(WIFI_STA); WiFi.disconnect();
+  WiFi.macAddress(myMac);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  WiFi.setSleep(false);
+  
   esp_now_init(); esp_now_register_recv_cb(onDataRecv);
 
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
-  if (!SD.begin(SD_CS, SPI, 10000000)) Serial.println("SD FAIL");
+  pinMode(VOL_UP_PIN, INPUT);
+  pinMode(VOL_DN_PIN, INPUT);
 
-  esp_now_peer_info_t bcast = {}; memcpy(bcast.peer_addr, broadcastAddr, 6); esp_now_add_peer(&bcast);
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+  if (!SD.begin(SD_CS, SPI, 8000000)) { Serial.println("SD FAIL"); delay(1000); }
+  else {
+    sdAvailable = true;
+    loadSettings();
+  }
+
+  esp_now_peer_info_t bcast = {}; 
+  memcpy(bcast.peer_addr, broadcastAddr, 6); 
+  bcast.channel = 1; 
+  bcast.encrypt = false;
+  bcast.ifidx = WIFI_IF_STA;
+  esp_now_add_peer(&bcast);
 
   unsigned long start = millis();
   while (millis() - start < 5000) { if (lastMasterHeard > 0) break; delay(100); }
@@ -550,26 +749,70 @@ void setup() {
     unsigned long wait = millis(); while (MY_ID == 0 && millis() - wait < 3000) delay(100);
   }
 
-  startProvisioning();
+  runProvisioningEngine();
 
-  for (int i = 0; i < 2; i++) {
+  // Attach servos after SD/SPI init to avoid pin conflicts
+  for (int i = 0; i < 3; i++) {
     servos[i].servo.attach(servos[i].pin, servos[i].minPulse, servos[i].maxPulse);
     servos[i].servo.write(map(servos[i].currentPos, 0, 100, 0, 180));
   }
+
+  // Start background tasks last
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 2, &audioTaskHandle, 1);
+  xTaskCreatePinnedToCore(servoTask, "ServoTask", 4096, NULL, 0, &servoTaskHandle, 0);
+  Serial.println("SETUP COMPLETE");
 }
 
-void loop() {
-  vTaskDelete(NULL); // Kill Arduino loop to 100% free Core 1 for Audio Task!
+void loadSettings() {
+  if (!sdAvailable) return;
+  if (!SD.exists("/settings")) SD.mkdir("/settings");
+  if (!SD.exists("/settings/settings.ini")) {
+    saveSettings(); // Create default
+    return;
+  }
+  
+  File f = SD.open("/settings/settings.ini");
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HT_MIN=")) servos[0].minPulse = line.substring(7).toInt();
+    else if (line.startsWith("HT_MAX=")) servos[0].maxPulse = line.substring(7).toInt();
+    else if (line.startsWith("HLT_MIN=")) servos[1].minPulse = line.substring(8).toInt();
+    else if (line.startsWith("HLT_MAX=")) servos[1].maxPulse = line.substring(8).toInt();
+    else if (line.startsWith("TR_MIN=")) servos[2].minPulse = line.substring(7).toInt();
+    else if (line.startsWith("TR_MAX=")) servos[2].maxPulse = line.substring(7).toInt();
+    else if (line.startsWith("VOL=")) globalVolume = line.substring(4).toInt();
+  }
+  f.close();
+  Serial.printf("Settings Loaded: Vol=%d\n", globalVolume);
+}
+
+void saveSettings() {
+  if (!sdAvailable) return;
+  File f = SD.open("/settings/settings.ini", FILE_WRITE);
+  if (!f) return;
+  f.printf("HT_MIN=%d\n", servos[0].minPulse);
+  f.printf("HT_MAX=%d\n", servos[0].maxPulse);
+  f.printf("HLT_MIN=%d\n", servos[1].minPulse);
+  f.printf("HLT_MAX=%d\n", servos[1].maxPulse);
+  f.printf("TR_MIN=%d\n", servos[2].minPulse);
+  f.printf("TR_MAX=%d\n", servos[2].maxPulse);
+  f.printf("VOL=%d\n", globalVolume);
+  f.close();
+  Serial.println("Settings Saved");
 }
 
 void clearSDRoot() { 
-  statusDisplay("CLEANING SD", 1);
-  File r = SD.open("/"); while(1) { File f = r.openNextFile(); if (!f) break; if (!f.isDirectory()) SD.remove("/" + String(f.name())); f.close(); } 
+  if (!sdAvailable) return;
+  File r = SD.open("/"); if (!r) return;
+  while(1) { File f = r.openNextFile(); if (!f) break; if (!f.isDirectory()) SD.remove("/" + String(f.name())); f.close(); } 
+  r.close();
 }
 void copyDirToRoot(int id) {
-  statusDisplay("COPYING D" + String(id), 1);
+  if (!sdAvailable) return;
   File d = SD.open("/" + String(id)); 
-  if (!d) { Serial.println("COPY: Dir not found: /" + String(id)); return; }
+  if (!d) return;
   while(1) {
     File f = d.openNextFile(); if (!f) break;
     if (f.isDirectory()) { f.close(); continue; }
@@ -586,7 +829,16 @@ void playDroidAudio(int id, int times) {
   for (int i = 0; i < times; i++) playWavFile(path);
 }
 
-void startProvisioning() { if (MY_ID == 0) return; statusDisplay("PROVISIONING", 1); clearSDRoot(); copyDirToRoot(MY_ID); statusDisplay("READY", 1); }
+void runProvisioningEngine() { 
+  Serial.println("PROVISION CHECK: ID=" + String(MY_ID) + " SD=" + String(sdAvailable));
+  if (MY_ID == 0 || !sdAvailable) return; 
+  statusDisplay("PROVISIONING", 1); 
+  statusDisplay("CLEANING SD", 1);
+  clearSDRoot(); 
+  statusDisplay("COPYING D" + String(MY_ID), 1);
+  copyDirToRoot(MY_ID); 
+  statusDisplay("SYSTEM READY - SYNC OK", 1); 
+}
 void statusDisplay(String msg, int size) {
   Serial.println("STATUS: " + msg);
   lastCommand = msg;
@@ -594,21 +846,38 @@ void statusDisplay(String msg, int size) {
 }
 
 void executeCommand(packet pkg) {
+  // STRICT FILTERING: Only execute if target is ALL or OUR ID.
   if (pkg.targetDroid != TARGET_ALL && pkg.targetDroid != MY_ID) return;
   
-  // Telemetry for Web Controller
   char logBuf[64];
-  if (pkg.msgType == CMD_SERVO_MOVE) snprintf(logBuf, sizeof(logBuf), "COMMAND: SM(%d, %s, %d, %d)", pkg.targetDroid, pkg.cmdStr, pkg.param2, pkg.param3);
-  else if (pkg.msgType == CMD_PLAY_AUDIO) snprintf(logBuf, sizeof(logBuf), "COMMAND: PA(%d, %s)", pkg.targetDroid, pkg.cmdStr);
-  else if (pkg.msgType == CMD_TALK) snprintf(logBuf, sizeof(logBuf), "COMMAND: TK(%d, %d)", pkg.targetDroid, pkg.param1);
-  else if (pkg.msgType == CMD_HEARTBEAT) return; // Don't log heartbeats
-  else snprintf(logBuf, sizeof(logBuf), "COMMAND: UNK(%d, %d)", pkg.targetDroid, pkg.msgType);
-  Serial.println(logBuf);
-  lastCommand = logBuf + 9; // Show just the command parts on OLED (skip "COMMAND: ")
-
+  // User-Friendly Status for OLED
   if (pkg.msgType == CMD_SERVO_MOVE) {
-    int s = (strcmp(pkg.cmdStr, "headturn") == 0) ? 0 : 1;
-    servos[s].targetPos = pkg.param2; servos[s].moveDuration = pkg.param3; servos[s].moveStartTime = millis(); servos[s].startPos = servos[s].currentPos;
+    if (strcmp(pkg.cmdStr, "headturn") == 0) snprintf(logBuf, sizeof(logBuf), "Turning Head: %d%%", pkg.param2);
+    else if (strcmp(pkg.cmdStr, "headtilt") == 0) snprintf(logBuf, sizeof(logBuf), "Tilting Head: %d%%", pkg.param2);
+    else if (strcmp(pkg.cmdStr, "torsoturn") == 0) snprintf(logBuf, sizeof(logBuf), "Turning Torso: %d%%", pkg.param2);
+    else snprintf(logBuf, sizeof(logBuf), "Moving %s: %d%%", pkg.cmdStr, pkg.param2);
+  } 
+  else if (pkg.msgType == CMD_PLAY_AUDIO) {
+    if (pkg.cmdStr[0] == '\0') snprintf(logBuf, sizeof(logBuf), "Playing Default BD%d", MY_ID);
+    else snprintf(logBuf, sizeof(logBuf), "Playing: %s", pkg.cmdStr);
+  }
+  else if (pkg.msgType == CMD_TALK) snprintf(logBuf, sizeof(logBuf), "Talking (%dms)", pkg.param1);
+  else if (pkg.msgType == CMD_HEARTBEAT) return; 
+  else snprintf(logBuf, sizeof(logBuf), "Command: %d", pkg.msgType);
+  
+  Serial.printf("EXEC (ME=D%d Target=D%d Type=%d): %s\n", MY_ID, pkg.targetDroid, pkg.msgType, logBuf);
+  lastCommand = logBuf;
+  
+  if (pkg.msgType == CMD_SERVO_MOVE) {
+    int s = -1;
+    if (strcmp(pkg.cmdStr, "headturn") == 0) s = 0;
+    else if (strcmp(pkg.cmdStr, "headtilt") == 0) s = 1;
+    else if (strcmp(pkg.cmdStr, "torsoturn") == 0) s = 2;
+    
+    if (s != -1) {
+      servos[s].targetPos = pkg.param2; servos[s].moveDuration = pkg.param3; 
+      servos[s].moveStartTime = millis(); servos[s].startPos = servos[s].currentPos;
+    }
   } else if (pkg.msgType == CMD_PLAY_AUDIO) {
     String p = (pkg.cmdStr[0] != '\0' && strcmp(pkg.cmdStr, "test") != 0) ? "/" + String(pkg.cmdStr) : "/BD" + String(MY_ID) + ".wav";
     playWavFile(p);

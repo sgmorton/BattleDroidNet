@@ -213,7 +213,7 @@
                 <div id="status-dot" class="status-dot"></div>
                 <span id="status-text">DISCONNECTED</span>
             </div>
-            <button id="connect-btn" style="width: auto; margin-bottom: 0;">Connect to Droid 1</button>
+            <button id="connect-btn" style="width: auto; margin-bottom: 0;">Connect to Droid Network</button>
         </div>
 
         <div class="fleet-panel">
@@ -234,18 +234,25 @@
             <div class="panel">
                 <h2>Operation Mode</h2>
                 <div style="display: flex; gap: 10px;">
-                    <button id="mode-auto" onclick="send('AUTO')">Auto</button>
-                    <button id="mode-manual" onclick="send('MANUAL')">Manual</button>
-                    <button id="mode-test" onclick="send('TEST')">Test</button>
+                    <button id="mode-auto" onclick="setMode('AUTO')">Auto</button>
+                    <button id="mode-manual" class="active" onclick="setMode('MANUAL')">Manual</button>
+                    <button id="mode-test" onclick="setMode('TEST')">Test</button>
                 </div>
                 <p style="font-size: 0.7rem; color: #888;">Auto mode plays sequences randomly every 2-5 minutes.</p>
             </div>
 
-            <div class="panel">
-                <h2>Quick Sequences</h2>
-                <button onclick="send('PLAY:Replaceable.txt')" class="active">Replaceable Test</button>
+            <div class="panel" style="grid-row: span 2;">
+                <h2>Sequences</h2>
+                <button onclick="send('PLAY:Replaceable.txt')">Replaceable Test</button>
                 <button onclick="send('PLAY:seq1.txt')">Execute Seq 1</button>
                 <button onclick="send('PLAY:seq2.txt')">Execute Seq 2</button>
+            </div>
+
+            <div class="panel">
+                <h2>Quick Commands</h2>
+                <button id="btn-announce" onclick="runAnnounce()">Announce</button>
+                <button onclick="runAttention()">Attention</button>
+                <button onclick="runCamel()">Camel</button>
             </div>
 
             <div class="panel" style="grid-column: span 2;">
@@ -317,6 +324,7 @@
                 log('Connected to serial port.');
 
                 writer = port.writable.getWriter();
+                await send('CONTROLLER');
                 readLoop();
             } catch (err) {
                 log('Error: ' + err.message);
@@ -342,6 +350,9 @@
                         if (cleanLine.startsWith('[[STATUS:') && cleanLine.endsWith(']]')) {
                             const statusStr = cleanLine.substring(9, 17);
                             updateFleetUI(statusStr);
+                        } else if (cleanLine.startsWith('[[MODE:') && cleanLine.endsWith(']]')) {
+                            const modeStr = cleanLine.substring(7, cleanLine.length - 2);
+                            updateModeUI(modeStr);
                         } else {
                             log(cleanLine, 'recv');
                         }
@@ -354,7 +365,9 @@
             }
         }
 
+        let currentFleetStatus = '00000000';
         function updateFleetUI(status) {
+            currentFleetStatus = status;
             for (let i = 0; i < 8; i++) {
                 const sq = document.getElementById(`dsq-${i+1}`);
                 if (status[i] === '1') {
@@ -363,6 +376,56 @@
                     sq.classList.remove('online');
                 }
             }
+        }
+
+        function updateModeUI(mode) {
+            const btnAuto = document.getElementById('mode-auto');
+            const btnManual = document.getElementById('mode-manual');
+            const btnTest = document.getElementById('mode-test');
+            
+            btnAuto.classList.remove('active');
+            btnManual.classList.remove('active');
+            btnTest.classList.remove('active');
+            
+            if (mode === 'AUTO') btnAuto.classList.add('active');
+            else if (mode === 'MANUAL') btnManual.classList.add('active');
+            else if (mode === 'TEST') btnTest.classList.add('active');
+        }
+
+        function setMode(mode) {
+            updateModeUI(mode);  // Immediate visual feedback
+            send(mode);          // Send command to firmware
+        }
+
+        async function runAnnounce() {
+            log("Starting Fleet Announcement...", "sent");
+            for (let i = 0; i < 8; i++) {
+                if (currentFleetStatus[i] === '1') {
+                    const droidId = i + 1;
+                    log(`Announcing Droid ${droidId}`, "sent");
+                    await send(`CMD:PA(${droidId}, bd${droidId}.wav)`);
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            }
+            log("Announcement Complete.", "sent");
+        }
+
+        async function runCamel() {
+            log("Executing Camel Maneuver...", "sent");
+            // Original Tilt head sequence: 75 -> 25 -> 50
+            const steps = [75, 25, 50]; 
+            for (let pos of steps) {
+                log(`Camel Step: Tilt ${pos}%`, "sent");
+                await send(`CMD:SM(*, headtilt, ${pos}, 800)`);
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            log("Camel Maneuver Complete.", "sent");
+        }
+
+        async function runAttention() {
+            log("Attention! Resetting servos to neutral point...", "sent");
+            await send(`CMD:SM(*, headturn, 50, 800)`);
+            await send(`CMD:SM(*, headtilt, 50, 800)`);
         }
 
         async function send(data) {
