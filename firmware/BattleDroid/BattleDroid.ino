@@ -107,13 +107,14 @@ String lastCommand = "IDLE";
 unsigned long lastMasterHeard = 0;
 unsigned long droidLastSeen[11];
 bool sdAvailable = false;
-int globalVolume = 5; // Default 1-10
+int globalVolume = 10; 
 
 // --- SERVO CONFIG ---
 typedef struct {
   int pin;
   int minPulse;
   int maxPulse;
+  bool inverted;
   int currentPos;
   int targetPos;
   int startPos;
@@ -123,9 +124,9 @@ typedef struct {
 } ServoConfig;
 
 ServoConfig servos[3] = {
-  {13, 500, 2500, 50, 50, 50, 0, 0}, // Head Turn
-  {14, 500, 2500, 50, 50, 50, 0, 0}, // Head Tilt
-  {12, 500, 2500, 50, 50, 50, 0, 0}  // Torso Turn
+  {13, 500, 2500, false, 50, 50, 50, 0, 0}, // Head Turn
+  {14, 500, 2500, false, 50, 50, 50, 0, 0}, // Head Tilt
+  {12, 500, 2500, false, 50, 50, 50, 0, 0}  // Torso Turn
 };
 
 bool isTalking = false;
@@ -565,7 +566,25 @@ void updateSerial() {
       saveSettings();
       Serial.printf("ID SET TO D%d\n", MY_ID);
     }
-    else if (line == "RESET") {
+    else {
+      int eqIdx = line.indexOf('=');
+      if (eqIdx != -1) {
+        String key = line.substring(0, eqIdx);
+        String val = line.substring(eqIdx + 1);
+        if (key == "min0") servos[0].minPulse = val.toInt();
+        else if (key == "max0") servos[0].maxPulse = val.toInt();
+        else if (key == "inv_headturn") servos[0].inverted = (val.toInt() == 1);
+        else if (key == "min1") servos[1].minPulse = val.toInt();
+        else if (key == "max1") servos[1].maxPulse = val.toInt();
+        else if (key == "inv_headtilt") servos[1].inverted = (val.toInt() == 1);
+        else if (key == "min2") servos[2].minPulse = val.toInt();
+        else if (key == "max2") servos[2].maxPulse = val.toInt();
+        else if (key == "inv_torsoturn") servos[2].inverted = (val.toInt() == 1);
+        else if (key == "vol") globalVolume = val.toInt();
+        saveSettings();
+      }
+    }
+    if (line == "RESET") {
       packet p = {}; p.msgType = CMD_RESET; p.targetDroid = TARGET_ALL;
       broadcastCommand(p);
       Serial.println("SENT FLEET RESET");
@@ -767,7 +786,7 @@ void loadSettings() {
   if (!sdAvailable) return;
   if (!SD.exists("/settings")) SD.mkdir("/settings");
   if (!SD.exists("/settings/settings.ini")) {
-    saveSettings(); // Create default
+    saveSettings(); 
     return;
   }
   
@@ -776,31 +795,34 @@ void loadSettings() {
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
-    if (line.startsWith("HT_MIN=")) servos[0].minPulse = line.substring(7).toInt();
-    else if (line.startsWith("HT_MAX=")) servos[0].maxPulse = line.substring(7).toInt();
-    else if (line.startsWith("HLT_MIN=")) servos[1].minPulse = line.substring(8).toInt();
-    else if (line.startsWith("HLT_MAX=")) servos[1].maxPulse = line.substring(8).toInt();
-    else if (line.startsWith("TR_MIN=")) servos[2].minPulse = line.substring(7).toInt();
-    else if (line.startsWith("TR_MAX=")) servos[2].maxPulse = line.substring(7).toInt();
-    else if (line.startsWith("VOL=")) globalVolume = line.substring(4).toInt();
+    int eq = line.indexOf('=');
+    if (eq != -1) {
+      String key = line.substring(0, eq);
+      String val = line.substring(eq + 1);
+      if (key == "min0") servos[0].minPulse = val.toInt();
+      else if (key == "max0") servos[0].maxPulse = val.toInt();
+      else if (key == "inv_headturn") servos[0].inverted = (val.toInt() == 1);
+      else if (key == "min1") servos[1].minPulse = val.toInt();
+      else if (key == "max1") servos[1].maxPulse = val.toInt();
+      else if (key == "inv_headtilt") servos[1].inverted = (val.toInt() == 1);
+      else if (key == "min2") servos[2].minPulse = val.toInt();
+      else if (key == "max2") servos[2].maxPulse = val.toInt();
+      else if (key == "inv_torsoturn") servos[2].inverted = (val.toInt() == 1);
+      else if (key == "vol") globalVolume = val.toInt();
+    }
   }
   f.close();
-  Serial.printf("Settings Loaded: Vol=%d\n", globalVolume);
 }
 
 void saveSettings() {
   if (!sdAvailable) return;
   File f = SD.open("/settings/settings.ini", FILE_WRITE);
   if (!f) return;
-  f.printf("HT_MIN=%d\n", servos[0].minPulse);
-  f.printf("HT_MAX=%d\n", servos[0].maxPulse);
-  f.printf("HLT_MIN=%d\n", servos[1].minPulse);
-  f.printf("HLT_MAX=%d\n", servos[1].maxPulse);
-  f.printf("TR_MIN=%d\n", servos[2].minPulse);
-  f.printf("TR_MAX=%d\n", servos[2].maxPulse);
-  f.printf("VOL=%d\n", globalVolume);
+  f.printf("min0=%d\nmax0=%d\ninv_headturn=%d\n", servos[0].minPulse, servos[0].maxPulse, (int)servos[0].inverted);
+  f.printf("min1=%d\nmax1=%d\ninv_headtilt=%d\n", servos[1].minPulse, servos[1].maxPulse, (int)servos[1].inverted);
+  f.printf("min2=%d\nmax2=%d\ninv_torsoturn=%d\n", servos[2].minPulse, servos[2].maxPulse, (int)servos[2].inverted);
+  f.printf("vol=%d\n", globalVolume);
   f.close();
-  Serial.println("Settings Saved");
 }
 
 void clearSDRoot() { 
@@ -842,7 +864,6 @@ void runProvisioningEngine() {
 void statusDisplay(String msg, int size) {
   Serial.println("STATUS: " + msg);
   lastCommand = msg;
-  // Removed forced updateMasterUI/updateSlaveUI to prevent I2S starvation during sequences
 }
 
 void executeCommand(packet pkg) {
@@ -869,14 +890,19 @@ void executeCommand(packet pkg) {
   lastCommand = logBuf;
   
   if (pkg.msgType == CMD_SERVO_MOVE) {
-    int s = -1;
-    if (strcmp(pkg.cmdStr, "headturn") == 0) s = 0;
-    else if (strcmp(pkg.cmdStr, "headtilt") == 0) s = 1;
-    else if (strcmp(pkg.cmdStr, "torsoturn") == 0) s = 2;
+    int sIdx = -1;
+    if (strcmp(pkg.cmdStr, "headturn") == 0) sIdx = 0;
+    else if (strcmp(pkg.cmdStr, "headtilt") == 0) sIdx = 1;
+    else if (strcmp(pkg.cmdStr, "torsoturn") == 0) sIdx = 2;
     
-    if (s != -1) {
-      servos[s].targetPos = pkg.param2; servos[s].moveDuration = pkg.param3; 
-      servos[s].moveStartTime = millis(); servos[s].startPos = servos[s].currentPos;
+    if (sIdx != -1) {
+      int p1 = servos[sIdx].inverted ? servos[sIdx].maxPulse : servos[sIdx].minPulse;
+      int p2 = servos[sIdx].inverted ? servos[sIdx].minPulse : servos[sIdx].maxPulse;
+      int pulse = map(pkg.param2, 0, 100, p1, p2);
+      servos[sIdx].servo.writeMicroseconds(pulse);
+      lastServoWrite[sIdx] = pkg.param2;
+      servos[sIdx].targetPos = pkg.param2; servos[sIdx].moveDuration = pkg.param3; 
+      servos[sIdx].moveStartTime = millis(); servos[sIdx].startPos = servos[sIdx].currentPos;
     }
   } else if (pkg.msgType == CMD_PLAY_AUDIO) {
     String p = (pkg.cmdStr[0] != '\0' && strcmp(pkg.cmdStr, "test") != 0) ? "/" + String(pkg.cmdStr) : "/BD" + String(MY_ID) + ".wav";
