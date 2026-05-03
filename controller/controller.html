@@ -347,12 +347,12 @@
 
                     for (const line of lines) {
                         const cleanLine = line.trim();
-                        if (cleanLine.startsWith('[[STATUS:') && cleanLine.endsWith(']]')) {
-                            const statusStr = cleanLine.substring(9, 17);
-                            updateFleetUI(statusStr);
-                        } else if (cleanLine.startsWith('[[MODE:') && cleanLine.endsWith(']]')) {
-                            const modeStr = cleanLine.substring(7, cleanLine.length - 2);
-                            updateModeUI(modeStr);
+                        if (cleanLine.includes('[[STATUS:')) {
+                            const match = cleanLine.match(/\[\[STATUS:([01]{8})\]\]/);
+                            if (match) updateFleetUI(match[1]);
+                        } else if (cleanLine.includes('[[MODE:')) {
+                            const match = cleanLine.match(/\[\[MODE:(.*?)\]\]/);
+                            if (match) updateModeUI(match[1]);
                         } else {
                             log(cleanLine, 'recv');
                         }

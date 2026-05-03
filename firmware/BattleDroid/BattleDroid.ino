@@ -18,6 +18,7 @@
 #define CMD_PLAY_AUDIO 4
 #define CMD_TALK 5
 #define CMD_RESET 6
+#define CMD_MODE_SET 7
 
 // --- MODE DEFINITIONS ---
 #define MODE_AUTO 0
@@ -29,8 +30,13 @@
 #define HEAD_TILT_CHUX 1
 #define TORSO_TURN_CHUX 2
 
-#define VOL_UP_PIN 39
-#define VOL_DN_PIN 36
+#define VOL_UP_PIN 2
+#define VOL_DN_PIN 15
+#define VOL_PUSH_PIN 33
+
+#define NAV_RIGHT_PIN 39
+#define NAV_LEFT_PIN 36
+#define NAV_PUSH_PIN 35
 
 #define TARGET_ALL 0xFF
 
@@ -140,6 +146,13 @@ File seqFile;
 unsigned long nextEventTime = 0;
 bool sequenceActive = false;
 String pendingCommands = "";
+
+// --- MENU STATE ---
+bool menuActive = false;
+bool menuSubActive = false;
+int menuIdx = 0;
+int menuSubIdx = 1;
+unsigned long lastMenuAction = 0;
 
 // --- TEST MODE STATE ---
 int testDroidIdx = 0;
@@ -355,17 +368,84 @@ void loop() {
   if (now - lastUpdate > 200) { 
     if (isMasterController) MY_ID = 0; 
 
-    // Handle Volume Rocker
-    static int lastVolUp = HIGH, lastVolDn = HIGH;
-    int volUp = digitalRead(VOL_UP_PIN);
-    int volDn = digitalRead(VOL_DN_PIN);
-    if (volUp == LOW && lastVolUp == HIGH) {
-      if (globalVolume < 10) { globalVolume++; Serial.printf("VOL UP: %d\n", globalVolume); saveSettings(); }
+    // Handle buttons (ignore first 2s to prevent boot noise)
+    if (now > 2000) {
+      static int lastVolUp = -1, lastVolDn = -1;
+      static int lastNavL = -1, lastNavR = -1, lastNavP = -1;
+      if (lastNavP == -1) {
+        lastVolUp = digitalRead(VOL_UP_PIN); lastVolDn = digitalRead(VOL_DN_PIN);
+        lastNavL = digitalRead(NAV_LEFT_PIN); lastNavR = digitalRead(NAV_RIGHT_PIN); lastNavP = digitalRead(NAV_PUSH_PIN);
+      }
+
+      // Handle Volume Rocker
+      int volUp = digitalRead(VOL_UP_PIN);
+      int volDn = digitalRead(VOL_DN_PIN);
+      if (volUp == LOW && lastVolUp == HIGH) {
+        if (globalVolume < 10) { globalVolume++; Serial.printf("VOL: %d\n", globalVolume); saveSettings(); }
+      }
+      if (volDn == LOW && lastVolDn == HIGH) {
+        if (globalVolume > 0) { globalVolume--; Serial.printf("VOL: %d\n", globalVolume); saveSettings(); }
+      }
+      lastVolUp = volUp; lastVolDn = volDn;
+
+      // Handle Menu Rocker (NAV)
+      int navL = digitalRead(NAV_LEFT_PIN);
+      int navR = digitalRead(NAV_RIGHT_PIN);
+      int navP = digitalRead(NAV_PUSH_PIN);
+
+      if ((navL == LOW && lastNavL == HIGH) || (navR == LOW && lastNavR == HIGH) || (navP == LOW && lastNavP == HIGH)) {
+        lastMenuAction = now;
+        if (!menuActive) {
+        if (navP == LOW && lastNavP == HIGH) {
+          menuActive = true;
+          if (!IS_MASTER) { menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); }
+          else { menuSubActive = false; menuIdx = 0; }
+          Serial.println("MENU: ACTIVE");
+        }
+      } else {
+        if (menuSubActive) {
+          if (navR == LOW && lastNavR == HIGH) { // Up button (39) decreases ID
+            menuSubIdx--; if (menuSubIdx < 1) menuSubIdx = 8;
+          }
+          else if (navL == LOW && lastNavL == HIGH) { // Down button (36) increases ID
+            menuSubIdx++; if (menuSubIdx > 8) menuSubIdx = 1;
+          }
+          else if (navP == LOW && lastNavP == HIGH) {
+            Serial.printf("MENU: ID CHANGE -> D%d\n", menuSubIdx);
+            MY_ID = menuSubIdx; 
+            if (MY_ID == 1) { IS_MASTER = true; isMasterController = false; }
+            else { IS_MASTER = false; }
+            saveSettings(); 
+            menuSubActive = false; menuActive = false;
+            if (IS_MASTER) updateMasterUI(); else updateSlaveUI();
+            runProvisioningEngine();
+          }
+        } else {
+          int maxIdx = 2; // 0=AUTO, 1=MANUAL, 2=CHOOSE DROID
+          if (navL == LOW && lastNavL == HIGH) { menuIdx++; if (menuIdx > maxIdx) menuIdx = 0; } // Down (L) moves Down
+          else if (navR == LOW && lastNavR == HIGH) { menuIdx--; if (menuIdx < 0) menuIdx = maxIdx; } // Up (R) moves Up
+          else if (navP == LOW && lastNavP == HIGH) {
+            if (menuIdx == 0) { 
+              currentMode = MODE_AUTO; 
+              menuActive = false; 
+              Serial.println("[[MODE:AUTO]]"); Serial.flush();
+              packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p);
+            }
+            else if (menuIdx == 1) { 
+              currentMode = MODE_MANUAL; 
+              menuActive = false; 
+              Serial.println("[[MODE:MANUAL]]"); Serial.flush();
+              packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p);
+            }
+            else { menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); Serial.println("MENU: SUB -> CHOOSE DROID"); }
+            if (!menuActive) { if (IS_MASTER) updateMasterUI(); else updateSlaveUI(); } 
+          }
+        }
+      }
+      }
+      if (menuActive && now - lastMenuAction > 15000) { menuActive = false; menuSubActive = false; Serial.println("MENU: TIMEOUT"); }
+      lastNavL = navL; lastNavR = navR; lastNavP = navP;
     }
-    if (volDn == LOW && lastVolDn == HIGH) {
-      if (globalVolume > 0) { globalVolume--; Serial.printf("VOL DN: %d\n", globalVolume); saveSettings(); }
-    }
-    lastVolUp = volUp; lastVolDn = volDn;
 
     if (IS_MASTER) {
       outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
@@ -377,7 +457,6 @@ void loop() {
       if (now - lastHb > 1000) { 
         outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
         esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
-        Serial.println("SENT HB ME=" + String(MY_ID));
         lastHb = now;
       }
       static unsigned long lastUi = 0;
@@ -582,7 +661,7 @@ void updateSerial() {
         else if (key == "min2") servos[2].minPulse = val.toInt();
         else if (key == "max2") servos[2].maxPulse = val.toInt();
         else if (key == "inv_torsoturn") servos[2].inverted = (val.toInt() == 1);
-        else if (key == "vol") globalVolume = val.toInt();
+        else if (key == "vol") { globalVolume = val.toInt(); Serial.printf("LOAD: Volume %d\n", globalVolume); }
         saveSettings();
       }
     }
@@ -639,11 +718,11 @@ void updateMasterUI() {
   display.setTextSize(1);
   const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
   display.setCursor(0, 20); display.printf("MODE: %s", modeStrs[currentMode]);
-  display.setCursor(0, 32); display.print("CMD: " + lastCommand.substring(0, 20));
+  display.setCursor(0, 32); display.print(lastCommand.substring(0, 20));
 
   // Fleet Status (Boxes at bottom)
   unsigned long now = millis();
-  int startX = 2; int y = 50; int boxW = 12; int boxH = 12; int gap = 4;
+  int startX = 2; int y = 48; int boxW = 12; int boxH = 10; int gap = 4;
   for (int i = 1; i <= 8; i++) {
     int x = startX + (i - 1) * (boxW + gap);
     bool online = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 10000));
@@ -653,11 +732,41 @@ void updateMasterUI() {
       display.drawRect(x, y, boxW, boxH, SSD1306_WHITE);
     }
   }
-  
-  // Volume Bar (Right Edge)
-  int volH = map(globalVolume, 0, 10, 0, 63);
-  display.drawFastVLine(127, 63 - volH, volH, SSD1306_WHITE);
-  
+
+  // Volume Bar (Horizontal at bottom)
+  int volW = map(globalVolume, 0, 10, 0, 124);
+  display.drawFastHLine(2, 60, volW, SSD1306_WHITE);
+  display.drawFastHLine(2, 61, volW, SSD1306_WHITE); // 2px height
+
+  if (menuActive) {
+    display.fillRect(10, 10, 108, 44, SSD1306_BLACK);
+    display.drawRect(10, 10, 108, 44, SSD1306_WHITE);
+    display.setTextSize(1); 
+    if (menuSubActive) {
+      display.setCursor(15, 15);
+      display.println("SELECT DROID ID:");
+      display.setTextSize(2); display.setCursor(50, 30); display.print("D" + String(menuSubIdx));
+      display.setTextSize(1);
+      bool online = (droidLastSeen[menuSubIdx] > 0 && (millis() - droidLastSeen[menuSubIdx] < 10000));
+      if (online && menuSubIdx != MY_ID) display.print(" - ONLINE");
+    } else {
+      display.setCursor(15, 15);
+      display.println("MENU:");
+      const char* opts[] = {"SET AUTO", "SET MANUAL", "CHOOSE DROID"};
+      for(int i=0; i<3; i++) {
+        display.setCursor(15, 23 + (i * 8));
+        if (menuIdx == i) {
+          display.fillRect(15, 23 + (i * 8), 98, 8, SSD1306_WHITE);
+          display.setTextColor(SSD1306_BLACK);
+        } else {
+          display.setTextColor(SSD1306_WHITE);
+        }
+        display.println(opts[i]);
+      }
+      display.setTextColor(SSD1306_WHITE);
+    }
+  }
+
   display.display();
 }
 
@@ -665,14 +774,33 @@ void updateSlaveUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0); display.println("Joined to HADB Network");
   display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID);
-  display.setCursor(0, 20); display.println(lastCommand);
+  display.setCursor(0, 20); display.println(lastCommand.substring(0, 20));
   display.setCursor(0, 32); display.setTextSize(2); 
   if (MY_ID == 0) display.println("SEARCH"); 
   else display.printf("UNIT: D%d", MY_ID);
 
-  // Volume Bar (Right Side)
-  int volH = map(globalVolume, 0, 10, 0, 62);
-  display.drawFastVLine(127, 63 - volH, volH, SSD1306_WHITE);
+  // Volume Bar (Horizontal at bottom)
+  int volW = map(globalVolume, 0, 10, 0, 124);
+  display.drawFastHLine(2, 60, volW, SSD1306_WHITE);
+  display.drawFastHLine(2, 61, volW, SSD1306_WHITE); // 2px height
+
+  if (menuActive) {
+    display.fillRect(10, 10, 108, 44, SSD1306_BLACK);
+    display.drawRect(10, 10, 108, 44, SSD1306_WHITE);
+    display.setTextSize(1); 
+    if (menuSubActive) {
+      display.setCursor(15, 15);
+      display.println("SELECT DROID ID:");
+      display.setTextSize(2); display.setCursor(50, 30); display.print("D" + String(menuSubIdx));
+      display.setTextSize(1);
+      bool online = (droidLastSeen[menuSubIdx] > 0 && (millis() - droidLastSeen[menuSubIdx] < 10000));
+      if (online && menuSubIdx != MY_ID) display.print(" - ONLINE");
+    } else {
+      display.setCursor(15, 15);
+      display.println("MENU:");
+      display.println("> CHOOSE DROID");
+    }
+  }
 
   display.display();
 }
@@ -704,6 +832,12 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
       esp_now_peer_info_t p = {}; memcpy(p.peer_addr, info->src_addr, 6);
       if (!esp_now_is_peer_exist(info->src_addr)) esp_now_add_peer(&p);
       packet assign = {CMD_ID_ASSIGN, (uint8_t)slot}; esp_now_send(info->src_addr, (uint8_t *)&assign, sizeof(assign));
+    }
+  } else if (inPkg.msgType == CMD_MODE_SET) {
+    currentMode = inPkg.targetDroid;
+    if (isMasterController) {
+       const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
+       Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]"); Serial.flush();
     }
   } else if (inPkg.msgType == CMD_ID_ASSIGN && MY_ID == 0 && !isMasterController) {
     MY_ID = inPkg.targetDroid;
@@ -756,8 +890,12 @@ void setup() {
   
   esp_now_init(); esp_now_register_recv_cb(onDataRecv);
 
-  pinMode(VOL_UP_PIN, INPUT);
-  pinMode(VOL_DN_PIN, INPUT);
+  pinMode(VOL_UP_PIN, INPUT_PULLUP);
+  pinMode(VOL_DN_PIN, INPUT_PULLUP);
+  pinMode(VOL_PUSH_PIN, INPUT_PULLUP);
+  pinMode(NAV_LEFT_PIN, INPUT);
+  pinMode(NAV_RIGHT_PIN, INPUT);
+  pinMode(NAV_PUSH_PIN, INPUT);
 
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   if (!SD.begin(SD_CS, SPI, 8000000)) { Serial.println("SD FAIL"); delay(1000); }
@@ -865,14 +1003,11 @@ void playDroidAudio(int id, int times) {
 }
 
 void runProvisioningEngine() { 
-  Serial.println("PROVISION CHECK: ID=" + String(MY_ID) + " SD=" + String(sdAvailable));
   if (MY_ID == 0 || !sdAvailable) return; 
-  statusDisplay("PROVISIONING", 1); 
-  statusDisplay("CLEANING SD", 1);
+  statusDisplay("Provisioning Droid " + String(MY_ID), 1); 
   clearSDRoot(); 
-  statusDisplay("COPYING D" + String(MY_ID), 1);
   copyDirToRoot(MY_ID); 
-  statusDisplay("SYSTEM READY - SYNC OK", 1); 
+  statusDisplay("Droid Provisioned", 1); 
 }
 void statusDisplay(String msg, int size) {
   Serial.println("STATUS: " + msg);
