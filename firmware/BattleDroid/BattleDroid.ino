@@ -1,4 +1,4 @@
-﻿#include "FS.h"
+#include "FS.h"
 #include "SD.h"
 #include "SPI.h"
 #include <Adafruit_GFX.h>
@@ -19,6 +19,7 @@
 #define CMD_TALK 5
 #define CMD_RESET 6
 #define CMD_MODE_SET 7
+#define CMD_START_SEQUENCE 10
 
 // --- MODE DEFINITIONS ---
 #define MODE_NET_AUTO 0
@@ -537,28 +538,31 @@ void startSequence(const char* filename) {
 }
 
 void updateSequencer() {
-  if (!IS_MASTER || currentMode == MODE_STANDALONE) return;
+  if (!sdAvailable) return;
+  if (MY_ID != 1 && !isMasterController && currentMode != MODE_STANDALONE) return;
   unsigned long now = millis();
 
-  static unsigned long lastStatusReport = 0;
-  if (now - lastStatusReport > 2000) {
-    char sBuf[32]; int pos = 0; pos += snprintf(sBuf + pos, sizeof(sBuf) - pos, "[[STATUS:");
-    for (int i = 1; i <= 8; i++) {
-      bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000));
-      // Droid 1 is implicitly online only if we are the standalone Master (not web controlled)
-      if (i == 1 && !isMasterController) isOnline = true;
-      sBuf[pos++] = isOnline ? '1' : '0';
-    }
-    snprintf(sBuf + pos, sizeof(sBuf) - pos, "]]"); Serial.println(sBuf);
-    
-    // Mode report for Web UI
-    const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
-    Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]");
+  if (IS_MASTER && currentMode != MODE_STANDALONE) {
+    static unsigned long lastStatusReport = 0;
+    if (now - lastStatusReport > 2000) {
+      char sBuf[32]; int pos = 0; pos += snprintf(sBuf + pos, sizeof(sBuf) - pos, "[[STATUS:");
+      for (int i = 1; i <= 8; i++) {
+        bool isOnline = (droidLastSeen[i] > 0 && (now - droidLastSeen[i] < 8000));
+        // Droid 1 is implicitly online only if we are the standalone Master (not web controlled)
+        if (i == 1 && !isMasterController) isOnline = true;
+        sBuf[pos++] = isOnline ? '1' : '0';
+      }
+      snprintf(sBuf + pos, sizeof(sBuf) - pos, "]]"); Serial.println(sBuf);
+      
+      // Mode report for Web UI
+      const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
+      Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]");
 
-    lastStatusReport = now;
+      lastStatusReport = now;
+    }
   }
 
-  if (currentMode == MODE_NET_AUTO && !sequenceActive && now > nextSequenceTime) {
+  if (IS_MASTER && currentMode == MODE_NET_AUTO && !sequenceActive && now > nextSequenceTime) {
     startSequence("/seq1.txt"); nextSequenceTime = now + random(120000, 300000);
   }
 
@@ -568,6 +572,7 @@ void updateSequencer() {
       if (pendingCommands.length() == 0) {
         String line = seqFile.readStringUntil('\n'); line.trim();
         if (line.length() == 0) continue;
+        Serial.println("SEQ: Line=" + line);
         int dashIdx = line.indexOf('-');
         if (dashIdx != -1) {
           nextEventTime = parseTime(line.substring(0, dashIdx));
@@ -637,7 +642,16 @@ void updateSerial() {
       saveSettings();
       Serial.printf("ID SET TO D%d\n", MY_ID);
     }
-    else if (line.startsWith("PLAY:")) startSequence(("/" + line.substring(5)).c_str());
+    else if (line.startsWith("PLAY:")) {
+      String fn = line.substring(5);
+      if (isMasterController) {
+        packet p = {CMD_START_SEQUENCE, 1}; // Send to Droid 1
+        strncpy(p.cmdStr, fn.c_str(), sizeof(p.cmdStr));
+        broadcastCommand(p);
+      } else {
+        startSequence(("/" + fn).c_str());
+      }
+    }
     else if (line.startsWith("CMD:")) {
       String cmd = line.substring(4); cmd.trim();
       packet p = {}; p.targetDroid = TARGET_ALL;
@@ -1147,4 +1161,7 @@ void executeCommand(packet pkg) {
     String p = (pkg.cmdStr[0] != '\0' && strcmp(pkg.cmdStr, "test") != 0) ? "/" + String(pkg.cmdStr) : "/BD" + String(MY_ID) + ".wav";
     playWavFile(p);
   } else if (pkg.msgType == CMD_TALK) { isTalking = true; talkEndTime = millis() + pkg.param1; }
+  else if (pkg.msgType == CMD_START_SEQUENCE) {
+    if (MY_ID == 1) startSequence(("/" + String(pkg.cmdStr)).c_str());
+  }
 }
