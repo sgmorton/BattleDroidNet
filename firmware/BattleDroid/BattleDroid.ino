@@ -1,4 +1,4 @@
-#include "FS.h"
+﻿#include "FS.h"
 #include "SD.h"
 #include "SPI.h"
 #include <Adafruit_GFX.h>
@@ -21,9 +21,9 @@
 #define CMD_MODE_SET 7
 
 // --- MODE DEFINITIONS ---
-#define MODE_AUTO 0
-#define MODE_MANUAL 1
-#define MODE_TEST 2
+#define MODE_NET_AUTO 0
+#define MODE_NET_MANUAL 1
+#define MODE_STANDALONE 2
 
 // --- SERVO DEFINITIONS ---
 #define HEAD_TURN_CHUX 0
@@ -139,7 +139,7 @@ bool isTalking = false;
 unsigned long talkEndTime = 0;
 unsigned long nextTalkMove = 0;
 
-int currentMode = MODE_MANUAL; // Start in MANUAL mode for readiness
+int currentMode = MODE_NET_MANUAL; // Start in NET MANUAL mode for readiness
 unsigned long nextSequenceTime = 0;
 unsigned long sequenceStartTime = 0;
 File seqFile;
@@ -398,8 +398,8 @@ void loop() {
         if (!menuActive) {
         if (navP == LOW && lastNavP == HIGH) {
           menuActive = true;
-          if (!IS_MASTER) { menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); }
-          else { menuSubActive = false; menuIdx = 0; }
+          menuSubActive = false; // Always start at main menu
+          menuIdx = 0;
           Serial.println("MENU: ACTIVE");
         }
       } else {
@@ -413,32 +413,56 @@ void loop() {
           else if (navP == LOW && lastNavP == HIGH) {
             Serial.printf("MENU: ID CHANGE -> D%d\n", menuSubIdx);
             MY_ID = menuSubIdx; 
+            currentMode = MODE_NET_MANUAL; // Reset to active fleet mode
             if (MY_ID == 1) { IS_MASTER = true; isMasterController = false; }
             else { IS_MASTER = false; }
             saveSettings(); 
             menuSubActive = false; menuActive = false;
             if (IS_MASTER) updateMasterUI(); else updateSlaveUI();
-            runProvisioningEngine();
+            provisionAssets();
           }
         } else {
-          int maxIdx = 2; // 0=AUTO, 1=MANUAL, 2=CHOOSE DROID
+          int maxIdx = IS_MASTER ? 3 : 1; 
           if (navL == LOW && lastNavL == HIGH) { menuIdx++; if (menuIdx > maxIdx) menuIdx = 0; } // Down (L) moves Down
           else if (navR == LOW && lastNavR == HIGH) { menuIdx--; if (menuIdx < 0) menuIdx = maxIdx; } // Up (R) moves Up
           else if (navP == LOW && lastNavP == HIGH) {
-            if (menuIdx == 0) { 
-              currentMode = MODE_AUTO; 
-              menuActive = false; 
-              Serial.println("[[MODE:AUTO]]"); Serial.flush();
-              packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p);
+            if (IS_MASTER) {
+              if (menuIdx == 0 || menuIdx == 1) {
+                if (currentMode == MODE_STANDALONE) {
+                  currentMode = (menuIdx == 0) ? MODE_NET_AUTO : MODE_NET_MANUAL;
+                  startNetworkJoin();
+                  menuActive = false;
+                } else {
+                  currentMode = (menuIdx == 0) ? MODE_NET_AUTO : MODE_NET_MANUAL;
+                  packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p);
+                }
+              }
+              else if (menuIdx == 2) { menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); Serial.println("MENU: SUB -> CHOOSE DROID"); }
+              else if (menuIdx == 3) { 
+                currentMode = MODE_STANDALONE; 
+                Serial.println("[[MODE:STANDALONE]]"); Serial.flush(); 
+                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
+              }
+            } else {
+              if (menuIdx == 0) { 
+                if (currentMode == MODE_STANDALONE) {
+                  currentMode = MODE_NET_AUTO;
+                  startNetworkJoin();
+                  menuActive = false;
+                } else {
+                  menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); Serial.println("MENU: SUB -> CHOOSE DROID"); 
+                }
+              }
+              else if (menuIdx == 1) { 
+                currentMode = MODE_STANDALONE; 
+                Serial.println("MODE: STANDALONE ACTIVE"); 
+                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
+              }
             }
-            else if (menuIdx == 1) { 
-              currentMode = MODE_MANUAL; 
-              menuActive = false; 
-              Serial.println("[[MODE:MANUAL]]"); Serial.flush();
-              packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p);
-            }
-            else { menuSubActive = true; menuSubIdx = (MY_ID == 0 ? 1 : MY_ID); Serial.println("MENU: SUB -> CHOOSE DROID"); }
+            bool isIDSelection = (IS_MASTER && menuIdx == 2) || (!IS_MASTER && menuIdx == 0);
+            if (!isIDSelection) menuActive = false; // Close menu on mode change
             if (!menuActive) { if (IS_MASTER) updateMasterUI(); else updateSlaveUI(); } 
+            saveSettings();
           }
         }
       }
@@ -447,21 +471,25 @@ void loop() {
       lastNavL = navL; lastNavR = navR; lastNavP = navP;
     }
 
-    if (IS_MASTER) {
-      outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
-      esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
-      droidLastSeen[MY_ID] = now;
-      updateMasterUI();
-    } else {
-      static unsigned long lastHb = 0;
-      if (now - lastHb > 1000) { 
+    static unsigned long lastUi = 0;
+    if (now - lastUi > 500) {
+      if (IS_MASTER && currentMode != MODE_STANDALONE) {
         outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
         esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
-        lastHb = now;
+        droidLastSeen[MY_ID] = now;
+        updateMasterUI();
+      } else {
+        static unsigned long lastHb = 0;
+        if (currentMode != MODE_STANDALONE && now - lastHb > 1000) { 
+          outPkg.msgType = CMD_HEARTBEAT; outPkg.targetDroid = MY_ID;
+          esp_now_send(broadcastAddr, (uint8_t *)&outPkg, sizeof(outPkg));
+          lastHb = now;
+        }
+        updateSlaveUI();
       }
-      static unsigned long lastUi = 0;
-      if (now - lastUi > 500) { updateSlaveUI(); lastUi = now; }
+      lastUi = now;
     }
+    
     lastUpdate = now;
   }
   updateSequencer(); 
@@ -509,51 +537,8 @@ void startSequence(const char* filename) {
 }
 
 void updateSequencer() {
-  if (!IS_MASTER) return;
+  if (!IS_MASTER || currentMode == MODE_STANDALONE) return;
   unsigned long now = millis();
-
-  if (currentMode == MODE_TEST) {
-    int delayTime = (testServoIdx == 0) ? 5000 : 1500; // Wait 5s after the last step (Audio was index 2)
-    if (now - lastTestMove > (unsigned long)delayTime) {
-      bool foundNext = false; 
-      if (testServoIdx == 0) {
-        int startSearch = testDroidIdx;
-        for (int i = 0; i < 8; i++) {
-          testDroidIdx++; if (testDroidIdx > 8) testDroidIdx = 1;
-          // Test if droid is online OR if it's Droid 1 (always test D1)
-          if ((droidLastSeen[testDroidIdx] > 0 && (now - droidLastSeen[testDroidIdx] < 8000)) || testDroidIdx == 1) { foundNext = true; break; }
-          if (testDroidIdx == startSearch) break;
-        }
-      } else { foundNext = true; }
-
-      if (foundNext) {
-        packet p = {}; p.targetDroid = testDroidIdx;
-        char statusMsg[32];
-        if (testServoIdx == 0) {
-          p.msgType = CMD_SERVO_MOVE; p.param2 = testPoints[testPointIdx]; p.param3 = 400;
-          strncpy(p.cmdStr, "headturn", 15);
-          snprintf(statusMsg, sizeof(statusMsg), "TEST D%d TURN", testDroidIdx);
-        } else if (testServoIdx == 1) {
-          p.msgType = CMD_SERVO_MOVE; p.param2 = testPoints[testPointIdx]; p.param3 = 400;
-          strncpy(p.cmdStr, "headtilt", 15);
-          snprintf(statusMsg, sizeof(statusMsg), "TEST D%d TILT", testDroidIdx);
-        } else {
-          // Audio step: Show status on OLED but don't send broadcast command (keep quiet)
-          snprintf(statusMsg, sizeof(statusMsg), "TEST D%d AUDIO (SILENT)", testDroidIdx);
-          p.msgType = 0xFF; // Invalid type to prevent execution
-        }
-        lastCommand = statusMsg;
-        if (p.msgType != 0xFF) broadcastCommand(p);
-        
-        testServoIdx++; 
-        if (testServoIdx >= 3) { 
-          testServoIdx = 0; 
-          testPointIdx++; if (testPointIdx >= 3) testPointIdx = 0;
-        }
-      }
-      lastTestMove = millis(); 
-    }
-  }
 
   static unsigned long lastStatusReport = 0;
   if (now - lastStatusReport > 2000) {
@@ -567,13 +552,13 @@ void updateSequencer() {
     snprintf(sBuf + pos, sizeof(sBuf) - pos, "]]"); Serial.println(sBuf);
     
     // Mode report for Web UI
-    const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
+    const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
     Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]");
 
     lastStatusReport = now;
   }
 
-  if (currentMode == MODE_AUTO && !sequenceActive && now > nextSequenceTime) {
+  if (currentMode == MODE_NET_AUTO && !sequenceActive && now > nextSequenceTime) {
     startSequence("/seq1.txt"); nextSequenceTime = now + random(120000, 300000);
   }
 
@@ -639,36 +624,18 @@ void updateSerial() {
     
     if (!IS_MASTER) return; // Only Master (or promoted controller) handles fleet commands
 
-    if (line == "AUTO") currentMode = MODE_AUTO;
-    else if (line == "MANUAL") currentMode = MODE_MANUAL;
-    else if (line == "TEST") currentMode = MODE_TEST;
+    if (line == "AUTO") { currentMode = MODE_NET_AUTO; saveSettings(); packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p); }
+    else if (line == "MANUAL") { currentMode = MODE_NET_MANUAL; saveSettings(); packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p); }
+    else if (line == "STANDALONE") { currentMode = MODE_STANDALONE; saveSettings(); }
+    else if (line == "RESET") {
+      packet p = {}; p.msgType = CMD_RESET; p.targetDroid = TARGET_ALL;
+      broadcastCommand(p);
+      Serial.println("SENT FLEET RESET");
+    }
     else if (line.startsWith("SETID ")) {
       MY_ID = line.substring(6).toInt();
       saveSettings();
       Serial.printf("ID SET TO D%d\n", MY_ID);
-    }
-    else {
-      int eqIdx = line.indexOf('=');
-      if (eqIdx != -1) {
-        String key = line.substring(0, eqIdx);
-        String val = line.substring(eqIdx + 1);
-        if (key == "min0") servos[0].minPulse = val.toInt();
-        else if (key == "max0") servos[0].maxPulse = val.toInt();
-        else if (key == "inv_headturn") servos[0].inverted = (val.toInt() == 1);
-        else if (key == "min1") servos[1].minPulse = val.toInt();
-        else if (key == "max1") servos[1].maxPulse = val.toInt();
-        else if (key == "inv_headtilt") servos[1].inverted = (val.toInt() == 1);
-        else if (key == "min2") servos[2].minPulse = val.toInt();
-        else if (key == "max2") servos[2].maxPulse = val.toInt();
-        else if (key == "inv_torsoturn") servos[2].inverted = (val.toInt() == 1);
-        else if (key == "vol") { globalVolume = val.toInt(); Serial.printf("LOAD: Volume %d\n", globalVolume); }
-        saveSettings();
-      }
-    }
-    if (line == "RESET") {
-      packet p = {}; p.msgType = CMD_RESET; p.targetDroid = TARGET_ALL;
-      broadcastCommand(p);
-      Serial.println("SENT FLEET RESET");
     }
     else if (line.startsWith("PLAY:")) startSequence(("/" + line.substring(5)).c_str());
     else if (line.startsWith("CMD:")) {
@@ -702,6 +669,15 @@ void updateSerial() {
         }
       }
     }
+    else {
+      int eqIdx = line.indexOf('=');
+      if (eqIdx != -1) {
+        String key = line.substring(0, eqIdx);
+        String val = line.substring(eqIdx + 1);
+        if (key == "vol") { globalVolume = val.toInt(); Serial.printf("SERIAL VOL: %d\n", globalVolume); }
+        saveSettings();
+      }
+    }
   }
 }
 
@@ -716,7 +692,7 @@ void updateMasterUI() {
   
   // Mode and Command (Normal)
   display.setTextSize(1);
-  const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
+  const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
   display.setCursor(0, 20); display.printf("MODE: %s", modeStrs[currentMode]);
   display.setCursor(0, 32); display.print(lastCommand.substring(0, 20));
 
@@ -752,8 +728,10 @@ void updateMasterUI() {
     } else {
       display.setCursor(15, 15);
       display.println("MENU:");
-      const char* opts[] = {"SET AUTO", "SET MANUAL", "CHOOSE DROID"};
-      for(int i=0; i<3; i++) {
+      const char* opt0 = (currentMode == MODE_STANDALONE) ? "JOIN NET (AUTO)" : "NET AUTO";
+      const char* opt1 = (currentMode == MODE_STANDALONE) ? "JOIN NET (MAN)" : "NET MANUAL";
+      const char* opts[] = {opt0, opt1, "CHOOSE DROID", "STAND ALONE"};
+      for(int i=0; i<4; i++) {
         display.setCursor(15, 23 + (i * 8));
         if (menuIdx == i) {
           display.fillRect(15, 23 + (i * 8), 98, 8, SSD1306_WHITE);
@@ -773,10 +751,12 @@ void updateMasterUI() {
 void updateSlaveUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0); display.println("Joined to HADB Network");
-  display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID);
+  if (currentMode == MODE_STANDALONE) { display.setCursor(0, 10); display.println("MODE: STAND ALONE"); }
+  else { display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID); }
   display.setCursor(0, 20); display.println(lastCommand.substring(0, 20));
   display.setCursor(0, 32); display.setTextSize(2); 
-  if (MY_ID == 0) display.println("SEARCH"); 
+  if (currentMode == MODE_STANDALONE) display.println("ISOLATION");
+  else if (MY_ID == 0) display.println("SEARCH"); 
   else display.printf("UNIT: D%d", MY_ID);
 
   // Volume Bar (Horizontal at bottom)
@@ -798,7 +778,19 @@ void updateSlaveUI() {
     } else {
       display.setCursor(15, 15);
       display.println("MENU:");
-      display.println("> CHOOSE DROID");
+      const char* opt0 = (currentMode == MODE_STANDALONE) ? "JOIN NETWORK" : "CHOOSE DROID";
+      const char* opts[] = {opt0, "STAND ALONE"};
+      for(int i=0; i<2; i++) {
+        display.setCursor(15, 23 + (i * 8));
+        if (menuIdx == i) {
+          display.fillRect(15, 23 + (i * 8), 98, 8, SSD1306_WHITE);
+          display.setTextColor(SSD1306_BLACK);
+        } else {
+          display.setTextColor(SSD1306_WHITE);
+        }
+        display.println(opts[i]);
+      }
+      display.setTextColor(SSD1306_WHITE);
     }
   }
 
@@ -810,13 +802,20 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
   if (memcmp(info->src_addr, myMac, 6) == 0) return;
 
   memcpy(&inPkg, data, sizeof(inPkg));
+  if (currentMode == MODE_STANDALONE) return; // Ignore everything in Standalone mode
+  
   if (IS_MASTER && inPkg.msgType != CMD_HEARTBEAT) Serial.println("RECV PKT: T=" + String(inPkg.targetDroid) + " ME=" + String(MY_ID) + " TYPE=" + String(inPkg.msgType));
 
   if (inPkg.msgType == CMD_HEARTBEAT) {
     if (inPkg.targetDroid == 0 || inPkg.targetDroid == 1) lastMasterHeard = millis();
     if (IS_MASTER && inPkg.targetDroid > 0 && inPkg.targetDroid <= 8) {
-      if (droidLastSeen[inPkg.targetDroid] == 0) Serial.println("FLEET: D" + String(inPkg.targetDroid) + " ONLINE");
-      droidLastSeen[inPkg.targetDroid] = millis();
+      if (inPkg.param1 == 0xFFFF) {
+        droidLastSeen[inPkg.targetDroid] = 0;
+        Serial.println("FLEET: D" + String(inPkg.targetDroid) + " OFFLINE (MANUAL)");
+      } else {
+        if (droidLastSeen[inPkg.targetDroid] == 0) Serial.println("FLEET: D" + String(inPkg.targetDroid) + " ONLINE");
+        droidLastSeen[inPkg.targetDroid] = millis();
+      }
     }
   } else if (inPkg.msgType == CMD_RESET) {
     Serial.println("FLEET RESET RECEIVED");
@@ -835,10 +834,9 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
     }
   } else if (inPkg.msgType == CMD_MODE_SET) {
     currentMode = inPkg.targetDroid;
-    if (isMasterController) {
-       const char* modeStrs[] = {"AUTO", "MANUAL", "TEST"};
-       Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]"); Serial.flush();
-    }
+    saveSettings(); 
+    const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
+    Serial.println("[[MODE:" + String(modeStrs[currentMode]) + "]]"); Serial.flush();
   } else if (inPkg.msgType == CMD_ID_ASSIGN && MY_ID == 0 && !isMasterController) {
     MY_ID = inPkg.targetDroid;
   }
@@ -848,7 +846,7 @@ void setup() {
   Serial.begin(115200);
   for(int i=0; i<3; i++) { 
     Serial.println("###################################");
-    Serial.println("###   BATTLE DROID V2.1 ACTIVE  ###");
+    Serial.println("###   BATTLE DROID V2.2 ACTIVE  ###");
     Serial.println("###################################");
     delay(100); 
   }
@@ -911,15 +909,7 @@ void setup() {
   bcast.ifidx = WIFI_IF_STA;
   esp_now_add_peer(&bcast);
 
-  unsigned long start = millis();
-  while (millis() - start < 5000) { if (lastMasterHeard > 0) break; delay(100); }
-  if (lastMasterHeard == 0) { IS_MASTER = true; MY_ID = 1; droidLastSeen[1] = millis(); }
-  else {
-    packet req = {CMD_ID_REQUEST, 0}; esp_now_send(broadcastAddr, (uint8_t *)&req, sizeof(req));
-    unsigned long wait = millis(); while (MY_ID == 0 && millis() - wait < 3000) delay(100);
-  }
-
-  runProvisioningEngine();
+  startNetworkJoin();
 
   // Attach servos after SD/SPI init to avoid pin conflicts
   for (int i = 0; i < 3; i++) {
@@ -935,14 +925,23 @@ void setup() {
 
 void loadSettings() {
   if (!sdAvailable) return;
-  if (!SD.exists("/settings")) SD.mkdir("/settings");
-  if (!SD.exists("/settings/settings.ini")) {
+  
+  // Cleanup legacy settings folder if it exists
+  if (SD.exists("/settings")) {
+    Serial.println("SETTINGS: CLEANING LEGACY FOLDER");
+    if (SD.exists("/settings/settings.ini")) SD.remove("/settings/settings.ini");
+    SD.rmdir("/settings");
+  }
+
+  if (!SD.exists("/settings.ini")) {
+    Serial.println("SETTINGS: NOT FOUND - CREATING DEFAULT");
     saveSettings(); 
     return;
   }
   
-  File f = SD.open("/settings/settings.ini");
-  if (!f) return;
+  File f = SD.open("/settings.ini");
+  if (!f) { Serial.println("SETTINGS: OPEN FAIL (READ)"); return; }
+  Serial.println("SETTINGS: LOADING...");
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -950,36 +949,88 @@ void loadSettings() {
     if (eq != -1) {
       String key = line.substring(0, eq);
       String val = line.substring(eq + 1);
-      if (key == "min0") servos[0].minPulse = val.toInt();
-      else if (key == "max0") servos[0].maxPulse = val.toInt();
-      else if (key == "inv_headturn") servos[0].inverted = (val.toInt() == 1);
-      else if (key == "min1") servos[1].minPulse = val.toInt();
-      else if (key == "max1") servos[1].maxPulse = val.toInt();
-      else if (key == "inv_headtilt") servos[1].inverted = (val.toInt() == 1);
-      else if (key == "min2") servos[2].minPulse = val.toInt();
-      else if (key == "max2") servos[2].maxPulse = val.toInt();
-      else if (key == "inv_torsoturn") servos[2].inverted = (val.toInt() == 1);
-      else if (key == "vol") globalVolume = val.toInt();
+      if (key == "min_head_turn") { servos[0].minPulse = val.toInt(); Serial.printf("  HEAD_TURN_MIN: %d\n", servos[0].minPulse); }
+      else if (key == "max_head_turn") { servos[0].maxPulse = val.toInt(); Serial.printf("  HEAD_TURN_MAX: %d\n", servos[0].maxPulse); }
+      else if (key == "inv_head_turn") servos[0].inverted = (val.toInt() == 1);
+      else if (key == "min_head_tilt") { servos[1].minPulse = val.toInt(); Serial.printf("  HEAD_TILT_MIN: %d\n", servos[1].minPulse); }
+      else if (key == "max_head_tilt") { servos[1].maxPulse = val.toInt(); Serial.printf("  HEAD_TILT_MAX: %d\n", servos[1].maxPulse); }
+      else if (key == "inv_head_tilt") servos[1].inverted = (val.toInt() == 1);
+      else if (key == "min_torso_turn") { servos[2].minPulse = val.toInt(); Serial.printf("  TORSO_TURN_MIN: %d\n", servos[2].minPulse); }
+      else if (key == "max_torso_turn") { servos[2].maxPulse = val.toInt(); Serial.printf("  TORSO_TURN_MAX: %d\n", servos[2].maxPulse); }
+      else if (key == "inv_torso_turn") servos[2].inverted = (val.toInt() == 1);
+      else if (key == "vol") { globalVolume = val.toInt(); Serial.printf("  VOL: %d\n", globalVolume); }
+      else if (key == "mode") { 
+        if (val == "NET_AUTO" || val == "AUTO") currentMode = MODE_NET_AUTO;
+        else if (val == "NET_MANUAL" || val == "MANUAL") currentMode = MODE_NET_MANUAL;
+        else if (val == "STAND_ALONE" || val == "STANDALONE") currentMode = MODE_STANDALONE;
+        Serial.printf("  MODE: %s\n", val.c_str()); 
+      }
+      else if (key == "id") { MY_ID = val.toInt(); Serial.printf("  ID: %d\n", MY_ID); }
     }
   }
   f.close();
+  Serial.println("SETTINGS: LOADED");
 }
 
 void saveSettings() {
   if (!sdAvailable) return;
-  File f = SD.open("/settings/settings.ini", FILE_WRITE);
-  if (!f) return;
-  f.printf("min0=%d\nmax0=%d\ninv_headturn=%d\n", servos[0].minPulse, servos[0].maxPulse, (int)servos[0].inverted);
-  f.printf("min1=%d\nmax1=%d\ninv_headtilt=%d\n", servos[1].minPulse, servos[1].maxPulse, (int)servos[1].inverted);
-  f.printf("min2=%d\nmax2=%d\ninv_torsoturn=%d\n", servos[2].minPulse, servos[2].maxPulse, (int)servos[2].inverted);
-  f.printf("vol=%d\n", globalVolume);
+  
+  // Explicitly remove to ensure a fresh, truncated file
+  if (SD.exists("/settings.ini")) SD.remove("/settings.ini");
+  if (SD.exists("/SETTINGS.INI")) SD.remove("/SETTINGS.INI");
+  
+  File f = SD.open("/settings.ini", FILE_WRITE); // FILE_WRITE will create new since we removed it
+  if (!f) { Serial.println("SETTINGS: OPEN FAIL (WRITE)"); return; }
+  
+  f.print("min_head_turn="); f.println(servos[0].minPulse);
+  f.print("max_head_turn="); f.println(servos[0].maxPulse);
+  f.print("inv_head_turn="); f.println((int)servos[0].inverted);
+  
+  f.print("min_head_tilt="); f.println(servos[1].minPulse);
+  f.print("max_head_tilt="); f.println(servos[1].maxPulse);
+  f.print("inv_head_tilt="); f.println((int)servos[1].inverted);
+  
+  f.print("min_torso_turn="); f.println(servos[2].minPulse);
+  f.print("max_torso_turn="); f.println(servos[2].maxPulse);
+  f.print("inv_torso_turn="); f.println((int)servos[2].inverted);
+  
+  f.print("vol="); f.println(globalVolume);
+  
+  f.print("mode=");
+  if (currentMode == MODE_NET_AUTO) f.println("NET_AUTO");
+  else if (currentMode == MODE_NET_MANUAL) f.println("NET_MANUAL");
+  else if (currentMode == MODE_STANDALONE) f.println("STAND_ALONE");
+  else f.println("NET_MANUAL"); // Default
+  
+  f.print("id="); f.println(MY_ID);
+  
+  f.flush();
   f.close();
+  Serial.println("SETTINGS: SAVED SUCCESSFULLY");
+
+  // Read-back verification for debugging
+  File v = SD.open("/settings.ini", FILE_READ);
+  if (v) {
+    Serial.println("SETTINGS: VERIFYING FILE CONTENT:");
+    while(v.available()) {
+      Serial.write(v.read());
+    }
+    v.close();
+    Serial.println("SETTINGS: VERIFICATION COMPLETE");
+  }
 }
 
 void clearSDRoot() { 
   if (!sdAvailable) return;
   File r = SD.open("/"); if (!r) return;
-  while(1) { File f = r.openNextFile(); if (!f) break; if (!f.isDirectory()) SD.remove("/" + String(f.name())); f.close(); } 
+  while(1) { 
+    File f = r.openNextFile(); if (!f) break; 
+    String name = String(f.name());
+    if (!f.isDirectory() && name != "settings.ini" && name != "/settings.ini") {
+      SD.remove("/" + name); 
+    }
+    f.close(); 
+  } 
   r.close();
 }
 void copyDirToRoot(int id) {
@@ -1002,12 +1053,52 @@ void playDroidAudio(int id, int times) {
   for (int i = 0; i < times; i++) playWavFile(path);
 }
 
-void runProvisioningEngine() { 
+void provisionAssets() { 
   if (MY_ID == 0 || !sdAvailable) return; 
-  statusDisplay("Provisioning Droid " + String(MY_ID), 1); 
+  statusDisplay("PROVISIONING D" + String(MY_ID), 1); 
   clearSDRoot(); 
   copyDirToRoot(MY_ID); 
-  statusDisplay("Droid Provisioned", 1); 
+  statusDisplay("PROVISIONED", 1); 
+}
+
+void startNetworkJoin() {
+  if (currentMode == MODE_STANDALONE) {
+    IS_MASTER = false;
+    Serial.println("BOOT: STANDALONE MODE - SKIPPING FLEET SYNC");
+    provisionAssets();
+    return;
+  }
+  
+  statusDisplay("SEARCHING NET", 0);
+  Serial.println("PROV: SEARCHING FOR MASTER...");
+  unsigned long start = millis();
+  lastMasterHeard = 0; 
+  MY_ID = 0; 
+  
+  while (millis() - start < 5000 && lastMasterHeard == 0) {
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+  
+  if (lastMasterHeard == 0) {
+    Serial.println("PROV: NO MASTER FOUND. BECOMING MASTER D1");
+    IS_MASTER = true; MY_ID = 1;
+    statusDisplay("BECOMING MASTER", 1);
+  } else {
+    Serial.println("PROV: MASTER FOUND. REQUESTING ID...");
+    packet req = {CMD_ID_REQUEST, 0}; esp_now_send(broadcastAddr, (uint8_t *)&req, sizeof(req));
+    unsigned long wait = millis(); 
+    while (MY_ID == 0 && millis() - wait < 3000) vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    if (MY_ID == 0) {
+       IS_MASTER = true; MY_ID = 1;
+       statusDisplay("BECOMING MASTER", 1);
+    } else {
+       IS_MASTER = false;
+       statusDisplay("JOINED FLEET", 1);
+    }
+  }
+  saveSettings();
+  provisionAssets();
 }
 void statusDisplay(String msg, int size) {
   Serial.println("STATUS: " + msg);
