@@ -705,9 +705,11 @@ void updateMasterUI() {
   
   // Header (Large)
   display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(4, 0);
-  if (isMasterController) display.print("CONTROLLER");
-  else display.print("MASTER");
+  display.setCursor(0, 0);
+  if (currentMode == MODE_STANDALONE) display.print("DISCONN.");
+  else if (isMasterController) display.print("CONTROLLER");
+  else if (MY_ID == 1) display.print("MASTER");
+  else { display.setTextSize(1); display.print("ONLINE HADB"); }
   
   // Mode and Command (Normal)
   display.setTextSize(1);
@@ -775,7 +777,11 @@ void updateMasterUI() {
 
 void updateSlaveUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0); display.println("Joined to HADB Network");
+  display.setCursor(0, 0); 
+  if (currentMode == MODE_STANDALONE) display.println("DISCONNECTED");
+  else if (isMasterController) { display.setTextSize(2); display.println("CONTROLLER"); display.setTextSize(1); }
+  else if (MY_ID == 1) { display.setTextSize(2); display.println("MASTER"); display.setTextSize(1); }
+  else display.println("ONLINE HADB");
   if (currentMode == MODE_STANDALONE) { display.setCursor(0, 10); display.println("MODE: STAND ALONE"); }
   else { display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID); }
   
