@@ -176,7 +176,7 @@
 
         .fleet-grid {
             display: flex;
-            justify-content: center;
+            justify-content: flex-start;
             gap: 10px;
             margin-top: 10px;
         }
@@ -197,10 +197,27 @@
         }
 
         .droid-sq.online {
-            background: rgba(68, 255, 68, 0.1);
-            border-color: #44ff44;
-            color: #44ff44;
-            box-shadow: 0 0 15px rgba(68, 255, 68, 0.2);
+            background: rgba(68, 255, 68, 0.2) !important;
+            border-color: #44ff44 !important;
+            color: #44ff44 !important;
+            box-shadow: 0 0 15px rgba(68, 255, 68, 0.3) !important;
+        }
+
+        .help-panel {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0, 102, 255, 0.1);
+            border: 1px solid var(--secondary);
+            border-radius: 12px;
+            font-size: 0.85rem;
+            line-height: 1.4;
+            color: var(--text);
+        }
+
+        .help-panel h2 {
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            color: var(--primary);
         }
     </style>
 </head>
@@ -208,25 +225,27 @@
     <div class="container">
         <h1>HADB Battledroid Control Center</h1>
         
-        <div class="status-panel">
-            <div class="status-item">
-                <div id="status-dot" class="status-dot"></div>
-                <span id="status-text">DISCONNECTED</span>
+        <div class="fleet-panel" style="display: flex; justify-content: space-between; align-items: center; padding: 20px 30px;">
+            <div style="flex: 1;">
+                <h2 style="text-align: left; margin-bottom: 5px;">Fleet Status Overview</h2>
+                <div class="fleet-grid" id="fleet-grid">
+                    <div class="droid-sq" id="dsq-1">D1</div>
+                    <div class="droid-sq" id="dsq-2">D2</div>
+                    <div class="droid-sq" id="dsq-3">D3</div>
+                    <div class="droid-sq" id="dsq-4">D4</div>
+                    <div class="droid-sq" id="dsq-5">D5</div>
+                    <div class="droid-sq" id="dsq-6">D6</div>
+                    <div class="droid-sq" id="dsq-7">D7</div>
+                    <div class="droid-sq" id="dsq-8">D8</div>
+                </div>
             </div>
-            <button id="connect-btn" style="width: auto; margin-bottom: 0;">Connect to Droid Network</button>
-        </div>
-
-        <div class="fleet-panel">
-            <h2>Fleet Status Overview</h2>
-            <div class="fleet-grid" id="fleet-grid">
-                <div class="droid-sq" id="dsq-1">D1</div>
-                <div class="droid-sq" id="dsq-2">D2</div>
-                <div class="droid-sq" id="dsq-3">D3</div>
-                <div class="droid-sq" id="dsq-4">D4</div>
-                <div class="droid-sq" id="dsq-5">D5</div>
-                <div class="droid-sq" id="dsq-6">D6</div>
-                <div class="droid-sq" id="dsq-7">D7</div>
-                <div class="droid-sq" id="dsq-8">D8</div>
+            
+            <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 12px; border-left: 1px solid var(--glass-border); padding-left: 30px;">
+                <div class="status-item">
+                    <div id="status-dot" class="status-dot"></div>
+                    <span id="status-text" style="font-weight: 800; letter-spacing: 1px; font-size: 0.8rem;">DISCONNECTED</span>
+                </div>
+                <button id="connect-btn" style="width: auto; margin-bottom: 0; padding: 8px 20px; font-size: 0.7rem;">Connect to Network</button>
             </div>
         </div>
 
@@ -262,6 +281,11 @@
                     <button id="send-btn" style="width: 100px;">Send</button>
                 </div>
             </div>
+        </div>
+
+        <div class="help-panel">
+            <h2>System Instructions</h2>
+            <p><strong>Droid 1</strong> is always considered the <strong>Fleet Master</strong>. Any sequences triggered from this controller will be orchestrated by Droid 1. Ensure all sequence files exist on Droid 1's SD card for successful execution.</p>
         </div>
 
         <h2 style="margin-top: 20px;">Telemetry Log</h2>
@@ -367,9 +391,11 @@
 
         let currentFleetStatus = '00000000';
         function updateFleetUI(status) {
+            console.log("Updating fleet UI with status:", status);
             currentFleetStatus = status;
             for (let i = 0; i < 8; i++) {
                 const sq = document.getElementById(`dsq-${i+1}`);
+                if (!sq) continue;
                 if (status[i] === '1') {
                     sq.classList.add('online');
                 } else {
@@ -379,17 +405,20 @@
         }
 
         function updateModeUI(mode) {
+            console.log("Updating mode UI:", mode);
             const btnAuto = document.getElementById('mode-auto');
             const btnManual = document.getElementById('mode-manual');
             const btnTest = document.getElementById('mode-test');
             
+            if (!btnAuto || !btnManual || !btnTest) return;
+
             btnAuto.classList.remove('active');
             btnManual.classList.remove('active');
             btnTest.classList.remove('active');
             
-            if (mode === 'AUTO') btnAuto.classList.add('active');
-            else if (mode === 'MANUAL') btnManual.classList.add('active');
-            else if (mode === 'TEST') btnTest.classList.add('active');
+            if (mode.includes('AUTO')) btnAuto.classList.add('active');
+            else if (mode.includes('MANUAL')) btnManual.classList.add('active');
+            else if (mode.includes('TEST')) btnTest.classList.add('active');
         }
 
         function setMode(mode) {

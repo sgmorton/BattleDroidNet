@@ -110,7 +110,7 @@ uint8_t myMac[6];
 bool IS_MASTER = false;
 bool isMasterController = false;
 int MY_ID = 0;
-String lastCommand = "IDLE";
+String lastCommand = "WAITING";
 unsigned long lastMasterHeard = 0;
 unsigned long droidLastSeen[11];
 bool sdAvailable = false;
@@ -207,14 +207,18 @@ void broadcastCommand(packet pkg) {
 volatile uint32_t audioDataRemaining = 0;
 
 void playWavFile(String path) {
-  if (!sdAvailable) return;
+  if (!sdAvailable) { lastCommand = "SD ERROR"; return; }
+  if (!SD.exists(path)) { 
+    lastCommand = "WAV NOT FOUND";
+    Serial.println("WAV: " + path + " NOT FOUND"); 
+    return; 
+  }
   if (audioStreaming) { 
     audioStreaming = false; 
     vTaskDelay(50 / portTICK_PERIOD_MS); // Let audioTask pause safely
     if (audioFile) audioFile.close(); 
   }
   
-  if (!SD.exists(path)) { Serial.println("WAV: File not found: " + path); return; }
   audioFile = SD.open(path);
   
   char chunkId[5] = {0};
@@ -538,11 +542,10 @@ void startSequence(const char* filename) {
 }
 
 void updateSequencer() {
-  if (!sdAvailable) return;
   if (MY_ID != 1 && !isMasterController && currentMode != MODE_STANDALONE) return;
   unsigned long now = millis();
 
-  if (IS_MASTER && currentMode != MODE_STANDALONE) {
+  if ((IS_MASTER || isMasterController) && currentMode != MODE_STANDALONE) {
     static unsigned long lastStatusReport = 0;
     if (now - lastStatusReport > 2000) {
       char sBuf[32]; int pos = 0; pos += snprintf(sBuf + pos, sizeof(sBuf) - pos, "[[STATUS:");
@@ -561,6 +564,8 @@ void updateSequencer() {
       lastStatusReport = now;
     }
   }
+
+  if (!sdAvailable) return;
 
   if (IS_MASTER && currentMode == MODE_NET_AUTO && !sequenceActive && now > nextSequenceTime) {
     startSequence("/seq1.txt"); nextSequenceTime = now + random(120000, 300000);
@@ -708,7 +713,13 @@ void updateMasterUI() {
   display.setTextSize(1);
   const char* modeStrs[] = {"NET AUTO", "NET MANUAL", "STAND ALONE"};
   display.setCursor(0, 20); display.printf("MODE: %s", modeStrs[currentMode]);
-  display.setCursor(0, 32); display.print(lastCommand.substring(0, 20));
+  
+  String uiMsg = lastCommand;
+  bool isAudioBusy = audioStreaming || (getAudioBytesInQueue() > 100); 
+  if (!isAudioBusy && !isTalking && !sequenceActive) {
+    if (uiMsg.startsWith("Playing") || uiMsg.startsWith("Talking") || uiMsg.startsWith("Command")) uiMsg = "WAITING";
+  }
+  display.setCursor(0, 32); display.print(uiMsg.substring(0, 20));
 
   // Fleet Status (Boxes at bottom)
   unsigned long now = millis();
@@ -767,7 +778,13 @@ void updateSlaveUI() {
   display.setCursor(0, 0); display.println("Joined to HADB Network");
   if (currentMode == MODE_STANDALONE) { display.setCursor(0, 10); display.println("MODE: STAND ALONE"); }
   else { display.setCursor(0, 10); if (MY_ID == 0) display.println("SLAVE - SEARCHING"); else display.printf("SLAVE - UNIT D%d", MY_ID); }
-  display.setCursor(0, 20); display.println(lastCommand.substring(0, 20));
+  
+  String uiMsg = lastCommand;
+  bool isAudioBusy = audioStreaming || (getAudioBytesInQueue() > 100);
+  if (!isAudioBusy && !isTalking && !sequenceActive) {
+    if (uiMsg.startsWith("Playing") || uiMsg.startsWith("Talking") || uiMsg.startsWith("Command")) uiMsg = "WAITING";
+  }
+  display.setCursor(0, 20); display.println(uiMsg.substring(0, 20));
   display.setCursor(0, 32); display.setTextSize(2); 
   if (currentMode == MODE_STANDALONE) display.println("ISOLATION");
   else if (MY_ID == 0) display.println("SEARCH"); 
