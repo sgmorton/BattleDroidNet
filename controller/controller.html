@@ -440,15 +440,43 @@
         }
 
         async function runCamel() {
-            log("Executing Camel Maneuver...", "sent");
-            // Original Tilt head sequence: 75 -> 25 -> 50
-            const steps = [75, 25, 50]; 
-            for (let pos of steps) {
-                log(`Camel Step: Tilt ${pos}%`, "sent");
-                await send(`CMD:SM(*, headtilt, ${pos}, 800)`);
-                await new Promise(r => setTimeout(r, 1000));
+            log("Starting Fleet Camel Sequence...", "sent");
+            
+            const stepDelay = 200; // Delay between droids
+            const phaseDelay = 1000; // Delay between phases
+
+            const phases = [
+                { name: "Head Tilt 25%", servo: "headtilt", pos: 25, time: 500 },
+                { name: "Head Tilt 75%", servo: "headtilt", pos: 75, time: 500 },
+                { name: "Head Turn 25%", servo: "headturn", pos: 25, time: 500 },
+                { name: "Head Turn 75%", servo: "headturn", pos: 75, time: 500 },
+                { name: "Torso Turn 25%", servo: "torsoturn", pos: 25, time: 600 },
+                { name: "Torso Turn 75%", servo: "torsoturn", pos: 75, time: 600 }
+            ];
+
+            for (let phase of phases) {
+                log(`Phase: ${phase.name}`, "sent");
+                for (let i = 1; i <= 8; i++) {
+                    if (currentFleetStatus[i-1] === '1') {
+                        // Announce droid ID during the first Head Turn wave
+                        if (phase.name === "Head Turn 25%") {
+                            await send(`CMD:PA(${i}, bd${i}.wav)`);
+                        }
+                        
+                        await send(`CMD:SM(${i}, ${phase.servo}, ${phase.pos}, ${phase.time})`);
+                        await new Promise(r => setTimeout(r, stepDelay));
+                    }
+                }
+                await new Promise(r => setTimeout(r, phaseDelay));
             }
-            log("Camel Maneuver Complete.", "sent");
+            
+            // Global Reset
+            log("Global Reset to Neutral (50%)...", "sent");
+            await send("CMD:SM(*, headturn, 50, 1200)");
+            await send("CMD:SM(*, headtilt, 50, 1200)");
+            await send("CMD:SM(*, torsoturn, 50, 1200)");
+            
+            log("Camel Sequence Complete.", "sent");
         }
 
         async function runAttention() {
