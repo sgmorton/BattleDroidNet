@@ -143,10 +143,18 @@ unsigned long nextTalkMove = 0;
 int currentMode = MODE_NET_MANUAL; // Start in NET MANUAL mode for readiness
 unsigned long nextSequenceTime = 0;
 unsigned long sequenceStartTime = 0;
-File seqFile;
+#define MAX_SEQ_LINES 150
+String seqLines[MAX_SEQ_LINES];
+int seqLineCount = 0;
+int seqCurrentLine = 0;
 unsigned long nextEventTime = 0;
 bool sequenceActive = false;
 String pendingCommands = "";
+unsigned long nextStandaloneAction = 0;
+bool standaloneSound = true;
+bool standaloneMovement = true;
+int standaloneMinDelay = 5000;
+String standaloneSeqName = "";
 
 // --- MENU STATE ---
 bool menuActive = false;
@@ -197,9 +205,13 @@ unsigned long parseTime(String tStr) {
 }
 
 void broadcastCommand(packet pkg) {
-  esp_err_t result = esp_now_send(broadcastAddr, (uint8_t *)&pkg, sizeof(pkg));
-  if (result != ESP_OK) Serial.println("SEND FAIL: " + String(result));
-  else Serial.println("SENT: type=" + String(pkg.msgType) + ", target=" + String(pkg.targetDroid));
+  if (currentMode != MODE_STANDALONE) {
+    esp_err_t result = esp_now_send(broadcastAddr, (uint8_t *)&pkg, sizeof(pkg));
+    if (result != ESP_OK) Serial.println("SEND FAIL: " + String(result));
+    else Serial.println("SENT: type=" + String(pkg.msgType) + ", target=" + String(pkg.targetDroid));
+  } else {
+    Serial.println("STANDALONE: Local Execute type=" + String(pkg.msgType) + ", target=" + String(pkg.targetDroid));
+  }
   // Execute locally if we are a droid (ID > 0) or the promoted controller
   if (MY_ID > 0 || isMasterController) executeCommand(pkg);
 }
@@ -207,9 +219,14 @@ void broadcastCommand(packet pkg) {
 volatile uint32_t audioDataRemaining = 0;
 
 void playWavFile(String path) {
+  if (currentMode == MODE_STANDALONE && !standaloneSound) return;
   if (!sdAvailable) { lastCommand = "SD ERROR"; return; }
   if (!SD.exists(path)) { 
-    lastCommand = "WAV NOT FOUND";
+    String disp = path;
+    if (disp.startsWith("/")) disp = disp.substring(1);
+    disp.replace(".wav", "");
+    disp.replace(".WAV", "");
+    lastCommand = "404: " + disp;
     Serial.println("WAV: " + path + " NOT FOUND"); 
     return; 
   }
@@ -249,27 +266,38 @@ void playWavFile(String path) {
     } else if (strncmp(chunkId, "data", 4) == 0) {
       foundData = true;
       audioDataRemaining = chunkSize;
-      // If chunkSize is zero or invalid, fallback to reading until EOF
       if (audioDataRemaining < 100) audioDataRemaining = 0xFFFFFFFF; 
-      Serial.printf("WAV: Data %u bytes\n", chunkSize);
+      Serial.printf("WAV: Data chunk %u bytes\n", chunkSize);
       break;
     } else {
+      if (chunkSize % 2 != 0) chunkSize++; // WAV chunks are strictly 2-byte aligned
       audioFile.seek(audioFile.position() + chunkSize);
     }
   }
 
   if (!foundData) { Serial.println("WAV: No data"); audioFile.close(); return; }
-  i2s_set_sample_rates(I2S_NUM_0, audioSampleRate);
-  
+
+  // Only reinitialise I2S hardware if the sample rate actually changed.
+  // Calling i2s_set_sample_rates() resets the DMA and causes a brief glitch.
+  static uint32_t currentI2SSampleRate = 0;
+  if (audioSampleRate != currentI2SSampleRate) {
+    i2s_set_sample_rates(I2S_NUM_0, audioSampleRate);
+    currentI2SSampleRate = audioSampleRate;
+    Serial.printf("WAV: I2S rate changed -> %u Hz\n", audioSampleRate);
+  }
+
+  // Wipe the DMA clean before pre-roll so no stale audio from the last track plays
+  i2s_zero_dma_buffer(I2S_NUM_0);
   audioHead = 0;
   audioTail = 0;
 
   // --- PRE-BUFFERING ---
-  // Load initial data to prevent stuttering
-  int prebufferSize = 256 * 1024; // Increased to 256KB for extra stability
-  if (audioBufferSize < prebufferSize) prebufferSize = audioBufferSize / 2;
+  // Fill a large initial buffer before starting playback to prevent startup stutter.
+  // We wait until 75% of the PSRAM buffer is filled OR the file is fully loaded.
+  uint32_t prerollTarget = min((uint32_t)(audioBufferSize * 3 / 4), (uint32_t)(512 * 1024));
+  Serial.printf("WAV: Pre-rolling %u KB...\n", prerollTarget / 1024);
 
-  while (audioDataRemaining > 0 && getAudioBytesInQueue() < prebufferSize) {
+  while (audioDataRemaining > 0 && getAudioBytesInQueue() < prerollTarget) {
     uint8_t tempBuf[2048];
     int toRead = min((uint32_t)sizeof(tempBuf), (uint32_t)audioDataRemaining);
     int bytesRead = audioFile.read(tempBuf, toRead);
@@ -334,7 +362,7 @@ void audioTask(void *parameter) {
           else enqueueAudio(tempBuf, bytesRead);
           didWork = true;
         } else {
-          audioDataRemaining = 0; // Force end on read error
+          audioDataRemaining = 0; // Natural EOF reached
           break;
         }
         // Yield occasionally if we're doing a lot of reads
@@ -346,16 +374,22 @@ void audioTask(void *parameter) {
         size_t bytesWritten = 0;
         int chunk = min(bytesInQueue, 4096);
         int contigChunk = min(chunk, audioBufferSize - audioTail);
-        i2s_write(I2S_NUM_0, psramAudioBuffer + audioTail, contigChunk, &bytesWritten, 0);
+        // Use portMAX_DELAY so we never drop a chunk when the DMA is temporarily full
+        i2s_write(I2S_NUM_0, psramAudioBuffer + audioTail, contigChunk, &bytesWritten, portMAX_DELAY);
         if (bytesWritten > 0) {
           audioTail = (audioTail + bytesWritten) % audioBufferSize;
           didWork = true;
         }
       } else if (audioDataRemaining == 0) {
-        vTaskDelay(250 / portTICK_PERIOD_MS); 
+        // Silence Flush: Push zeroes to force all real audio out of the DMA pipeline
+        uint8_t silence[4096] = {0};
+        for (int i = 0; i < 34; i++) { // 34 * 4096 = 139KB > 64*512*4 = 131KB DMA capacity
+          size_t bw = 0;
+          i2s_write(I2S_NUM_0, silence, sizeof(silence), &bw, portMAX_DELAY);
+        }
+        i2s_zero_dma_buffer(I2S_NUM_0); // Wipe any residual audio from hardware registers
         audioStreaming = false;
         audioFile.close();
-        i2s_zero_dma_buffer(I2S_NUM_0);
         Serial.println("WAV: Finished");
       }
       
@@ -447,6 +481,7 @@ void loop() {
                 currentMode = MODE_STANDALONE; 
                 Serial.println("[[MODE:STANDALONE]]"); Serial.flush(); 
                 packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
+                provisionAssets();
               }
             } else {
               if (menuIdx == 0) { 
@@ -462,6 +497,7 @@ void loop() {
                 currentMode = MODE_STANDALONE; 
                 Serial.println("MODE: STANDALONE ACTIVE"); 
                 packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
+                provisionAssets();
               }
             }
             bool isIDSelection = (IS_MASTER && menuIdx == 2) || (!IS_MASTER && menuIdx == 0);
@@ -475,7 +511,10 @@ void loop() {
       if (menuActive && now - lastMenuAction > 15000) { menuActive = false; menuSubActive = false; Serial.println("MENU: TIMEOUT"); }
       lastNavL = navL; lastNavR = navR; lastNavP = navP;
     }
-
+    updateSequencer();
+    handleStandaloneMode();
+  
+    static unsigned long lastTele = 0;
     static unsigned long lastUi = 0;
     if (now - lastUi > 500) {
       if (IS_MASTER && currentMode != MODE_STANDALONE) {
@@ -535,9 +574,17 @@ void servoTask(void *parameter) {
 }
 
 void startSequence(const char* filename) {
-  if (seqFile) seqFile.close();
-  seqFile = SD.open(filename);
-  if (!seqFile) return;
+  File f = SD.open(filename);
+  if (!f) return;
+  seqLineCount = 0;
+  seqCurrentLine = 0;
+  while(f.available() && seqLineCount < MAX_SEQ_LINES) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (line.length() > 0) {
+      seqLines[seqLineCount++] = line;
+    }
+  }
+  f.close();
   sequenceStartTime = millis(); sequenceActive = true; nextEventTime = 0; pendingCommands = "";
 }
 
@@ -573,11 +620,12 @@ void updateSequencer() {
 
   if (sequenceActive) {
     unsigned long seqElapsed = now - sequenceStartTime;
-    while (seqFile.available() || pendingCommands.length() > 0) {
+    while (seqCurrentLine < seqLineCount || pendingCommands.length() > 0) {
       if (pendingCommands.length() == 0) {
-        String line = seqFile.readStringUntil('\n'); line.trim();
+        String line = seqLines[seqCurrentLine++];
         if (line.length() == 0) continue;
-        Serial.println("SEQ: Line=" + line);
+        float seqT = (millis() - sequenceStartTime) / 1000.0;
+        Serial.printf("[SEQ: %5.2fs] PARSE: %s\n", seqT, line.c_str());
         int dashIdx = line.indexOf('-');
         if (dashIdx != -1) {
           nextEventTime = parseTime(line.substring(0, dashIdx));
@@ -593,6 +641,8 @@ void updateSequencer() {
           if (idStr != "*") p.targetDroid = idStr.toInt();
           String cmd = pendingCommands.substring(c + 1, e); cmd.trim();
           memset(p.cmdStr, 0, 16); strncpy(p.cmdStr, cmd.c_str(), 15);
+          float seqFire = (millis() - sequenceStartTime) / 1000.0;
+          Serial.printf("[SEQ: %5.2fs] FIRE: %s\n", seqFire, pendingCommands.c_str());
           broadcastCommand(p);
         } else if (pendingCommands.startsWith("SM")) {
           p.msgType = CMD_SERVO_MOVE;
@@ -604,17 +654,31 @@ void updateSequencer() {
           String cmd = args.substring(c1 + 1, c2); cmd.trim();
           memset(p.cmdStr, 0, 16); strncpy(p.cmdStr, cmd.c_str(), 15);
           p.param2 = args.substring(c2 + 1, c3).toInt(); p.param3 = args.substring(c3 + 1).toInt();
+          float seqFire = (millis() - sequenceStartTime) / 1000.0;
+          Serial.printf("[SEQ: %5.2fs] FIRE: %s\n", seqFire, pendingCommands.c_str());
           broadcastCommand(p);
         } else if (pendingCommands.startsWith("T(")) {
           p.msgType = CMD_TALK;
           int s = pendingCommands.indexOf('('); int c = pendingCommands.indexOf(','); int e = pendingCommands.indexOf(')');
-          p.targetDroid = pendingCommands.substring(s + 1, c).toInt(); p.param1 = pendingCommands.substring(c + 1, e).toInt();
+          String idStr = pendingCommands.substring(s + 1, c); idStr.trim();
+          if (idStr != "*") p.targetDroid = idStr.toInt();
+          p.param1 = pendingCommands.substring(c + 1, e).toInt();
+          float seqFire = (millis() - sequenceStartTime) / 1000.0;
+          Serial.printf("[SEQ: %5.2fs] FIRE: %s\n", seqFire, pendingCommands.c_str());
+          broadcastCommand(p);
+        } else if (pendingCommands.startsWith("RS")) {
+          p.msgType = CMD_RESET;
+          int s = pendingCommands.indexOf('('); int e = pendingCommands.indexOf(')');
+          String idStr = pendingCommands.substring(s + 1, e); idStr.trim();
+          if (idStr != "*") p.targetDroid = idStr.toInt();
+          float seqFire = (millis() - sequenceStartTime) / 1000.0;
+          Serial.printf("[SEQ: %5.2fs] FIRE: %s\n", seqFire, pendingCommands.c_str());
           broadcastCommand(p);
         }
         pendingCommands = "";
       } else { break; }
     }
-    if (!seqFile.available() && pendingCommands.length() == 0) { sequenceActive = false; seqFile.close(); }
+    if (seqCurrentLine >= seqLineCount && pendingCommands.length() == 0) { sequenceActive = false; }
   }
 }
 
@@ -636,7 +700,7 @@ void updateSerial() {
 
     if (line == "AUTO") { currentMode = MODE_NET_AUTO; saveSettings(); packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p); }
     else if (line == "MANUAL") { currentMode = MODE_NET_MANUAL; saveSettings(); packet p = {CMD_MODE_SET, (uint8_t)currentMode}; broadcastCommand(p); }
-    else if (line == "STANDALONE") { currentMode = MODE_STANDALONE; saveSettings(); }
+    else if (line == "STANDALONE") { currentMode = MODE_STANDALONE; saveSettings(); provisionAssets(); }
     else if (line == "RESET") {
       packet p = {}; p.msgType = CMD_RESET; p.targetDroid = TARGET_ALL;
       broadcastCommand(p);
@@ -706,7 +770,14 @@ void updateMasterUI() {
   // Header (Large)
   display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  if (currentMode == MODE_STANDALONE) display.print("DISCONN.");
+  if (currentMode == MODE_STANDALONE) {
+    if (sequenceActive || audioStreaming) {
+      display.print(standaloneSeqName.substring(0, 10));
+    } else {
+      unsigned long rem = (nextStandaloneAction > millis()) ? (nextStandaloneAction - millis()) / 1000 : 0;
+      display.printf("NEXT: %lus", rem);
+    }
+  }
   else if (isMasterController) display.print("CONTROLLER");
   else if (MY_ID == 1) display.print("MASTER");
   else { display.setTextSize(1); display.print("ONLINE HADB"); }
@@ -778,7 +849,14 @@ void updateMasterUI() {
 void updateSlaveUI() {
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0); 
-  if (currentMode == MODE_STANDALONE) display.println("DISCONNECTED");
+  if (currentMode == MODE_STANDALONE) {
+    if (sequenceActive || audioStreaming) {
+      display.println(standaloneSeqName.substring(0, 21));
+    } else {
+      unsigned long rem = (nextStandaloneAction > millis()) ? (nextStandaloneAction - millis()) / 1000 : 0;
+      display.printf("NEXT SEQ: %lus\n", rem);
+    }
+  }
   else if (isMasterController) { display.setTextSize(2); display.println("CONTROLLER"); display.setTextSize(1); }
   else if (MY_ID == 1) { display.setTextSize(2); display.println("MASTER"); display.setTextSize(1); }
   else display.println("ONLINE HADB");
@@ -898,7 +976,8 @@ void setup() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = 44100, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, .dma_buf_count = 64, .dma_buf_len = 512
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, .dma_buf_count = 64, .dma_buf_len = 512,
+    .tx_desc_auto_clear = true  // Auto-zero DMA buffers on underrun — prevents audio looping
   };
   i2s_pin_config_t pin_config = { .bck_io_num = I2S_BCLK, .ws_io_num = I2S_LRC, .data_out_num = I2S_DOUT, .data_in_num = -1 };
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL); i2s_set_pin(I2S_NUM_0, &pin_config);
@@ -1007,6 +1086,42 @@ void loadSettings() {
   }
   f.close();
   Serial.println("SETTINGS: LOADED");
+  loadStandaloneSettings();
+}
+
+void loadStandaloneSettings() {
+  if (!sdAvailable) return;
+  if (!SD.exists("/standalone.ini")) {
+    saveStandaloneSettings();
+    return;
+  }
+  File f = SD.open("/standalone.ini");
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    int eq = line.indexOf('=');
+    if (eq != -1) {
+      String key = line.substring(0, eq); key.toLowerCase();
+      String val = line.substring(eq + 1); val.toLowerCase();
+      if (key == "sound") standaloneSound = (val == "true");
+      else if (key == "movement") standaloneMovement = (val == "true");
+      else if (key == "mindelay") standaloneMinDelay = val.toInt() * 1000;
+    }
+  }
+  f.close();
+  Serial.printf("STANDALONE SETTINGS: Sound=%d, Move=%d, Delay=%d\n", standaloneSound, standaloneMovement, standaloneMinDelay);
+}
+
+void saveStandaloneSettings() {
+  if (!sdAvailable) return;
+  if (SD.exists("/standalone.ini")) SD.remove("/standalone.ini");
+  File f = SD.open("/standalone.ini", FILE_WRITE);
+  if (!f) return;
+  f.print("Sound="); f.println(standaloneSound ? "True" : "False");
+  f.print("Movement="); f.println(standaloneMovement ? "True" : "False");
+  f.print("MinDelay="); f.println(standaloneMinDelay);
+  f.close();
 }
 
 void saveSettings() {
@@ -1060,24 +1175,42 @@ void saveSettings() {
 void clearSDRoot() { 
   if (!sdAvailable) return;
   File r = SD.open("/"); if (!r) return;
+  
+  // ESP32 SD library doesn't like deleting files while iterating with openNextFile.
+  // We need to collect names first, then delete them.
+  String filesToDelete[30];
+  int deleteCount = 0;
+  
   while(1) { 
     File f = r.openNextFile(); if (!f) break; 
     String name = String(f.name());
-    if (!f.isDirectory() && name != "settings.ini" && name != "/settings.ini") {
-      SD.remove("/" + name); 
+    
+    // Protect settings and folders
+    if (!f.isDirectory() && name != "settings.ini" && name != "/settings.ini" && name != "standalone.ini" && name != "/standalone.ini") {
+      if (deleteCount < 30) {
+        filesToDelete[deleteCount++] = name.startsWith("/") ? name : ("/" + name);
+      }
     }
     f.close(); 
   } 
   r.close();
+  
+  // Now perform the actual deletions
+  for (int i = 0; i < deleteCount; i++) {
+    Serial.println("PROV: Deleting " + filesToDelete[i]);
+    SD.remove(filesToDelete[i]);
+  }
 }
-void copyDirToRoot(int id) {
+void copyDirToRoot(String folder) {
   if (!sdAvailable) return;
-  File d = SD.open("/" + String(id)); 
-  if (!d) return;
+  File d = SD.open("/" + folder); 
+  if (!d) { Serial.printf("PROV: Folder /%s not found\n", folder.c_str()); return; }
   while(1) {
     File f = d.openNextFile(); if (!f) break;
     if (f.isDirectory()) { f.close(); continue; }
-    File df = SD.open("/" + String(f.name()), FILE_WRITE);
+    String destPath = "/" + String(f.name());
+    if (destPath.endsWith("settings.ini") || destPath.endsWith("standalone.ini")) { f.close(); continue; }
+    File df = SD.open(destPath, FILE_WRITE);
     if (df) { uint8_t b[512]; while(f.available()) df.write(b, f.read(b, 512)); df.close(); }
     f.close();
   }
@@ -1091,11 +1224,19 @@ void playDroidAudio(int id, int times) {
 }
 
 void provisionAssets() { 
-  if (MY_ID == 0 || !sdAvailable) return; 
-  statusDisplay("PROVISIONING D" + String(MY_ID), 1); 
-  clearSDRoot(); 
-  copyDirToRoot(MY_ID); 
-  statusDisplay("PROVISIONED", 1); 
+  if (!sdAvailable) return; 
+  if (currentMode == MODE_STANDALONE) {
+    statusDisplay("PROV STANDALONE", 1);
+    clearSDRoot();
+    copyDirToRoot("standalone");
+    statusDisplay("PROVISIONED SA", 1);
+  } else {
+    if (MY_ID == 0) return;
+    statusDisplay("PROVISIONING D" + String(MY_ID), 1); 
+    clearSDRoot(); 
+    copyDirToRoot(String(MY_ID)); 
+    statusDisplay("PROVISIONED", 1); 
+  }
 }
 
 void startNetworkJoin() {
@@ -1162,10 +1303,17 @@ void executeCommand(packet pkg) {
   else if (pkg.msgType == CMD_HEARTBEAT) return; 
   else snprintf(logBuf, sizeof(logBuf), "Command: %d", pkg.msgType);
   
-  Serial.printf("EXEC (ME=D%d Target=D%d Type=%d): %s\n", MY_ID, pkg.targetDroid, pkg.msgType, logBuf);
+  float seqT = sequenceActive ? (millis() - sequenceStartTime) / 1000.0 : 0.0;
+  if (sequenceActive) {
+    Serial.printf("[SEQ: %5.2fs] EXEC (ME=D%d Target=D%d Type=%d): %s\n", seqT, MY_ID, pkg.targetDroid, pkg.msgType, logBuf);
+  } else {
+    Serial.printf("[NET] EXEC (ME=D%d Target=D%d Type=%d): %s\n", MY_ID, pkg.targetDroid, pkg.msgType, logBuf);
+  }
+  
   lastCommand = logBuf;
   
   if (pkg.msgType == CMD_SERVO_MOVE) {
+    if (currentMode == MODE_STANDALONE && !standaloneMovement) return;
     int sIdx = -1;
     if (strcmp(pkg.cmdStr, "headturn") == 0) sIdx = 0;
     else if (strcmp(pkg.cmdStr, "headtilt") == 0) sIdx = 1;
@@ -1181,10 +1329,67 @@ void executeCommand(packet pkg) {
       servos[sIdx].moveStartTime = millis(); servos[sIdx].startPos = servos[sIdx].currentPos;
     }
   } else if (pkg.msgType == CMD_PLAY_AUDIO) {
-    String p = (pkg.cmdStr[0] != '\0' && strcmp(pkg.cmdStr, "test") != 0) ? "/" + String(pkg.cmdStr) : "/BD" + String(MY_ID) + ".wav";
+    String p = "";
+    if (pkg.cmdStr[0] != '\0' && strcmp(pkg.cmdStr, "test") != 0) {
+      p = "/" + String(pkg.cmdStr);
+      if (!p.endsWith(".wav") && !p.endsWith(".WAV")) p += ".wav";
+    } else {
+      p = "/BD" + String(MY_ID) + ".wav";
+    }
     playWavFile(p);
   } else if (pkg.msgType == CMD_TALK) { isTalking = true; talkEndTime = millis() + pkg.param1; }
   else if (pkg.msgType == CMD_START_SEQUENCE) {
     if (MY_ID == 1) startSequence(("/" + String(pkg.cmdStr)).c_str());
   }
 }
+void handleStandaloneMode() {
+  if (currentMode != MODE_STANDALONE || !sdAvailable) return;
+
+  if (sequenceActive || audioStreaming) {
+    nextStandaloneAction = 0; // Reset timer while active
+    return;
+  }
+
+  if (nextStandaloneAction == 0) {
+    // Sequence just finished (or we just entered standalone mode). Start the timer.
+    nextStandaloneAction = millis() + (unsigned long)standaloneMinDelay + random(0, standaloneMinDelay);
+    Serial.printf("STANDALONE: Waiting %lu ms before next sequence\n", nextStandaloneAction - millis());
+    return;
+  }
+
+  if (millis() < nextStandaloneAction) return;
+
+  // Scan for .seq files
+  File root = SD.open("/");
+  if (!root) return;
+
+  String seqFiles[16];
+  int count = 0;
+  while (1) {
+    File f = root.openNextFile();
+    if (!f) break;
+    String name = String(f.name());
+    if (name.endsWith(".seq") || name.endsWith(".SEQ")) {
+      seqFiles[count++] = "/" + name;
+    }
+    f.close();
+    if (count >= 16) break;
+  }
+  root.close();
+
+  if (count > 0) {
+    int idx = random(0, count);
+    standaloneSeqName = seqFiles[idx];
+    standaloneSeqName.replace("/", "");
+    standaloneSeqName.replace(".seq", "");
+    standaloneSeqName.replace(".SEQ", "");
+    standaloneSeqName.toUpperCase();
+    
+    Serial.printf("STANDALONE: Starting random sequence %s\n", seqFiles[idx].c_str());
+    startSequence(seqFiles[idx].c_str());
+  } else {
+    // No sequences found, check again in 5s
+    nextStandaloneAction = millis() + 5000;
+  }
+}
+

@@ -50,12 +50,12 @@ Triggers audio playback on the target droid(s).
 
 ### 3. Talk: `TK`
 Triggers the randomized head-tilt "talking" animation.
-**Syntax:** `TK(target, duration)`
+**Syntax:** `T(target, duration)`
 
 - **duration**: How long the animation should last in milliseconds.
 
 **Example:**
-`00.10.00 - TK(2, 3000)`  
+`00.10.00 - T(2, 3000)`  
 *(At 10s, Droid 2 starts talking for 3 seconds)*
 
 ---
@@ -74,6 +74,6 @@ Returns all servos to their neutral position (50%).
 00.01.00 - PA(*, groove)
 00.01.50 - SM(1, headturn, 25, 500)
 00.01.50 - SM(2, headturn, 75, 500)
-00.02.00 - TK(*, 2000)
+00.02.00 - T(*, 2000)
 00.05.00 - RS(*)
 ```
