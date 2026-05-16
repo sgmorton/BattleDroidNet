@@ -94,10 +94,11 @@ void loadSettings();
 void saveSettings();
 
 void clearSDRoot();
-void copyDirToRoot(int id);
+void copyDirToRoot(String folder);
 void playDroidAudio(int id, int times);
 void startProvisioning();
 void playWavFile(String path);
+void runSystemCheck();
 void updateSequencer();
 void updateSerial();
 
@@ -138,6 +139,7 @@ ServoConfig servos[3] = {
 
 bool isTalking = false;
 unsigned long talkEndTime = 0;
+bool pendingStandaloneInit = false; // Deferred flag: run provision+syscheck on next loop tick
 unsigned long nextTalkMove = 0;
 
 int currentMode = MODE_NET_MANUAL; // Start in NET MANUAL mode for readiness
@@ -480,8 +482,9 @@ void loop() {
               else if (menuIdx == 3) { 
                 currentMode = MODE_STANDALONE; 
                 Serial.println("[[MODE:STANDALONE]]"); Serial.flush(); 
-                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
-                provisionAssets();
+                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p);
+                saveSettings();
+                pendingStandaloneInit = true; // Defer heavy SD work to main loop
               }
             } else {
               if (menuIdx == 0) { 
@@ -496,8 +499,9 @@ void loop() {
               else if (menuIdx == 1) { 
                 currentMode = MODE_STANDALONE; 
                 Serial.println("MODE: STANDALONE ACTIVE"); 
-                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p); // Notify fleet we are leaving
-                provisionAssets();
+                packet p = {CMD_HEARTBEAT, (uint8_t)MY_ID}; p.param1 = 0xFFFF; broadcastCommand(p);
+                saveSettings();
+                pendingStandaloneInit = true; // Defer heavy SD work to main loop
               }
             }
             bool isIDSelection = (IS_MASTER && menuIdx == 2) || (!IS_MASTER && menuIdx == 0);
@@ -538,6 +542,14 @@ void loop() {
   }
   updateSequencer(); 
   updateSerial();
+
+  // Deferred standalone init — runs outside menu handler to avoid FreeRTOS blocking
+  if (pendingStandaloneInit) {
+    pendingStandaloneInit = false;
+    Serial.println("INIT: Running deferred standalone provision + system check");
+    provisionAssets();
+  }
+
   vTaskDelay(10 / portTICK_PERIOD_MS);
 }
 
@@ -693,6 +705,26 @@ void updateSerial() {
       for(int i=0; i<11; i++) droidLastSeen[i] = 0;
       statusDisplay("CTRL MODE", 1);
       Serial.println("PROMOTED TO D0 CONTROLLER");
+      // Scan SD for .seq files and report back to the web controller
+      if (sdAvailable) {
+        File root = SD.open("/");
+        String seqList = "[[SEQLIST:";
+        bool first = true;
+        while (true) {
+          File entry = root.openNextFile();
+          if (!entry) break;
+          String name = String(entry.name());
+          if (!entry.isDirectory() && (name.endsWith(".seq") || name.endsWith(".SEQ"))) {
+            if (!first) seqList += ",";
+            seqList += name;
+            first = false;
+          }
+          entry.close();
+        }
+        root.close();
+        seqList += "]]";
+        Serial.println(seqList);
+      }
       return;
     }
     
@@ -1061,6 +1093,7 @@ void loadSettings() {
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
+    if (line.startsWith("#") || line.length() == 0) continue; // Skip comments and blank lines
     int eq = line.indexOf('=');
     if (eq != -1) {
       String key = line.substring(0, eq);
@@ -1100,6 +1133,7 @@ void loadStandaloneSettings() {
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
+    if (line.startsWith("#") || line.length() == 0) continue; // Skip comments and blank lines
     int eq = line.indexOf('=');
     if (eq != -1) {
       String key = line.substring(0, eq); key.toLowerCase();
@@ -1230,6 +1264,7 @@ void provisionAssets() {
     clearSDRoot();
     copyDirToRoot("standalone");
     statusDisplay("PROVISIONED SA", 1);
+    runSystemCheck();  // Servo sweep + audio confirmation
   } else {
     if (MY_ID == 0) return;
     statusDisplay("PROVISIONING D" + String(MY_ID), 1); 
@@ -1237,6 +1272,39 @@ void provisionAssets() {
     copyDirToRoot(String(MY_ID)); 
     statusDisplay("PROVISIONED", 1); 
   }
+}
+
+// Sweeps all three servos through 25/50/75/center at 750ms per step,
+// then plays standalone.wav as an audio-ok confirmation.
+void runSystemCheck() {
+  Serial.println("SYSCHECK: Starting servo & audio check...");
+  statusDisplay("SYSTEM CHECK", 1);
+
+  // Helper: move servo[idx] to position 0-100, wait for move to settle
+  auto moveServo = [](int idx, int pos) {
+    int p1 = servos[idx].inverted ? servos[idx].maxPulse : servos[idx].minPulse;
+    int p2 = servos[idx].inverted ? servos[idx].minPulse : servos[idx].maxPulse;
+    int pulse = map(pos, 0, 100, p1, p2);
+    servos[idx].servo.writeMicroseconds(pulse);
+    servos[idx].currentPos = pos;
+    servos[idx].targetPos  = pos;
+    servos[idx].startPos   = pos;
+    delay(750);
+  };
+
+  const int positions[] = {25, 50, 75, 50}; // 50 = center
+  const char* names[]   = {"headturn", "headtilt", "torsoturn"};
+
+  for (int s = 0; s < 3; s++) {
+    Serial.printf("SYSCHECK: %s\n", names[s]);
+    for (int p : positions) {
+      moveServo(s, p);
+    }
+  }
+
+  Serial.println("SYSCHECK: Playing standalone.wav");
+  statusDisplay("CHECK OK", 1);
+  playWavFile("/standalone.wav");
 }
 
 void startNetworkJoin() {
