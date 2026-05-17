@@ -222,7 +222,15 @@ volatile uint32_t audioDataRemaining = 0;
 
 void playWavFile(String path) {
   if (currentMode == MODE_STANDALONE && !standaloneSound) return;
-  if (!sdAvailable) { lastCommand = "SD ERROR"; return; }
+  if (!sdAvailable) {
+    if (SD.begin(SD_CS, SPI, 8000000)) {
+      sdAvailable = true;
+      Serial.println("WAV: SD card mounted successfully during playback request!");
+    } else {
+      lastCommand = "SD ERROR";
+      return;
+    }
+  }
   if (!SD.exists(path)) { 
     String disp = path;
     if (disp.startsWith("/")) disp = disp.substring(1);
@@ -586,6 +594,14 @@ void servoTask(void *parameter) {
 }
 
 void startSequence(const char* filename) {
+  if (!sdAvailable) {
+    if (SD.begin(SD_CS, SPI, 8000000)) {
+      sdAvailable = true;
+      Serial.println("SEQ: SD card mounted successfully during sequence start!");
+    } else {
+      return;
+    }
+  }
   File f = SD.open(filename);
   if (!f) return;
   seqLineCount = 0;
@@ -715,6 +731,8 @@ void updateSerial() {
           if (!entry) break;
           String name = String(entry.name());
           if (!entry.isDirectory() && (name.endsWith(".seq") || name.endsWith(".SEQ"))) {
+            int lastSlash = name.lastIndexOf('/');
+            if (lastSlash != -1) name = name.substring(lastSlash + 1);
             if (!first) seqList += ",";
             seqList += name;
             first = false;
@@ -1242,7 +1260,10 @@ void copyDirToRoot(String folder) {
   while(1) {
     File f = d.openNextFile(); if (!f) break;
     if (f.isDirectory()) { f.close(); continue; }
-    String destPath = "/" + String(f.name());
+    String fname = String(f.name());
+    int lastSlash = fname.lastIndexOf('/');
+    if (lastSlash != -1) fname = fname.substring(lastSlash + 1);
+    String destPath = "/" + fname;
     if (destPath.endsWith("settings.ini") || destPath.endsWith("standalone.ini")) { f.close(); continue; }
     File df = SD.open(destPath, FILE_WRITE);
     if (df) { uint8_t b[512]; while(f.available()) df.write(b, f.read(b, 512)); df.close(); }
@@ -1258,7 +1279,18 @@ void playDroidAudio(int id, int times) {
 }
 
 void provisionAssets() { 
-  if (!sdAvailable) return; 
+  if (!sdAvailable) {
+    Serial.println("PROV: SD card not mounted. Attempting to mount...");
+    if (SD.begin(SD_CS, SPI, 8000000)) {
+      sdAvailable = true;
+      Serial.println("PROV: SD card mounted successfully!");
+      loadSettings();
+    } else {
+      Serial.println("PROV: SD card mount FAILED");
+      statusDisplay("SD ERROR", 1);
+      return;
+    }
+  } 
   if (currentMode == MODE_STANDALONE) {
     statusDisplay("PROV STANDALONE", 1);
     clearSDRoot();
@@ -1437,6 +1469,8 @@ void handleStandaloneMode() {
     File f = root.openNextFile();
     if (!f) break;
     String name = String(f.name());
+    int lastSlash = name.lastIndexOf('/');
+    if (lastSlash != -1) name = name.substring(lastSlash + 1);
     if (name.endsWith(".seq") || name.endsWith(".SEQ")) {
       seqFiles[count++] = "/" + name;
     }
